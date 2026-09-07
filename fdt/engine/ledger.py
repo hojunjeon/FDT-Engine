@@ -467,6 +467,16 @@ def account_balance_at(
     `opening_balance` 가 있으면 전진 계산: `opening + Σ(as_of 이하 원장)`.
     없으면 as_of(twin.as_of) 잔액에서 역산: `balance - Σ(as_of 초과, twin.as_of
     이하 원장)`.
+
+    **`ledger` 인자는 반드시 전체 기간(적어도 twin.as_of 까지) 원장이어야
+    한다** (B1, 리뷰 20260907_W3_W4_W5.md). `opening_balance` 가 없는 계좌의
+    역산 분기는 `as_of` 초과 ~ `twin.as_of` 이하 구간 레코드를 직접 찾는다 -
+    이 구간이 이미 잘려나간 원장(예: `normalize(twin, as_of=effective_as_of)`
+    로 만든, `effective_as_of` 이하만 남은 원장)을 넘기면 그 합이 항상 0이
+    되어 `as_of` 를 과거로 당겨도 `twin.as_of` 시점 잔액이 그대로 나온다
+    (미래 잔액 누수). 호출자(`build_engine`)는 `twin.as_of` 까지의 전체
+    기간으로 `normalize` 한 원장을 넘기고, `Engine.ledger` 에 저장할
+    `effective_as_of` 이하 절단본은 별도로 만들어야 한다.
     """
 
     account = None
@@ -511,6 +521,14 @@ def reconcile(
     있으면 `strict=False` 일 때 `W-RECON` 경고(계좌 id·기대값·실제값·차액
     포함)를 모아 반환하고, `strict=True` 면 첫 불일치에서 바로
     `FdtError(E-RECON)` 을 던진다.
+
+    **`ledger` 인자는 반드시 전체 기간(적어도 twin.as_of 까지) 원장이어야
+    한다** (B2, 리뷰 20260907_W3_W4_W5.md). 대사는 정의상 `twin.as_of` 시점의
+    진짜 잔액과 맞춰야 하므로 `effective_as_of`(홀드아웃으로 당긴 as_of) 와
+    무관하다 - `effective_as_of` 이하로 잘린 원장을 넘기면 `twin.as_of` 까지의
+    레코드가 누락돼 과거 as_of 홀드아웃 빌드마다 가짜 `W-RECON`/`E-RECON`
+    이 뜬다. 호출자(`build_engine`)는 `normalize(twin, as_of=twin.as_of)` 로
+    만든 전체 기간 원장을 넘겨야 한다.
     """
 
     warnings: list[FdtWarning] = []

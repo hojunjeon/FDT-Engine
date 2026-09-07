@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ import typer
 from pydantic import ValidationError
 
 from fdt.engine.engine import build_engine
-from fdt.engine.errors import E_REQ_INVALID, E_REQ_RANGE, FdtError
+from fdt.engine.errors import E_REQ_INVALID, E_REQ_RANGE, FdtError, extract_errors
 from fdt.engine.schemas.input import TwinInput
 from fdt.engine.schemas.request import ModeRequest
 from fdt.engine.taxonomy import ENVELOPE_IDS
@@ -28,7 +29,6 @@ from fdt.tools.schema_export import export_json_schemas
 app = typer.Typer(help="FDT 엔진 테스트용 CLI")
 
 _ENVELOPE_NAME_BY_ID: dict[int, str] = {idx: name for name, idx in ENVELOPE_IDS.items()}
-_ERROR_CODE_RE = re.compile(r"\bE-[A-Z]+(?:-[A-Z_]+)+\b")
 
 
 def _echo_error(code: str, message: str, details: dict[str, Any] | None = None) -> None:
@@ -39,16 +39,50 @@ def _echo_error(code: str, message: str, details: dict[str, Any] | None = None) 
     typer.echo(json.dumps(payload, ensure_ascii=False))
 
 
-def _extract_error_code(message: str, default: str) -> str:
-    """CLI 표시용 최선 노력 코드 추출.
+def _echo_validation_error(exc: ValidationError) -> None:
+    """`pydantic.ValidationError` -> 구조화 오류 JSON (리뷰 N4·S39).
 
-    SPEC §9.1 은 `EngineResult.error.code` 를 pydantic 메시지 파싱으로
-    채우지 말라고 한다(엔진 결과 계약). 이 함수는 그 계약과 무관한
-    CLI 종료 코드 표시 편의용이며, 정규식으로 못 찾으면 `default` 를 쓴다.
+    `fdt.engine.errors.extract_errors()` 로 코드 손실 없이 복원한 뒤(정규식
+    파싱 없음), 첫 오류를 대표(`error.code`/`error.message`)로 삼고 전부를
+    `error.details.errors` 에 싣는다.
     """
 
-    match = _ERROR_CODE_RE.search(message)
-    return match.group(0) if match else default
+    errors = extract_errors(exc)
+    first = errors[0]
+    error_list = [
+        {"code": err.code, "message": err.message, "loc": err.details.get("loc", [])}
+        for err in errors
+    ]
+    _echo_error(first.code, first.message, {"errors": error_list})
+
+
+@contextmanager
+def _cli_error_guard() -> Iterator[None]:
+    """서브커맨드 최상위 안전망 (리뷰 N2·N3·N4, 요구사항 5).
+
+    개별 호출부에서 이미 더 구체적인 코드로 잡은 경우 이 지점까지 오지
+    않는다. 여기까지 올라오는 `FdtError`/`ValidationError`/`OSError`/
+    `json.JSONDecodeError` 는 예상치 못한 경로(예: 엔진 파일 쓰기 실패)이며,
+    트레이스백 대신 구조화된 오류 JSON + 종료 코드 1 로 끝낸다. 그 외
+    예외(버그)는 여기서 잡지 않고 그대로 전파한다.
+    """
+
+    try:
+        yield
+    except typer.Exit:
+        raise
+    except FdtError as exc:
+        _echo_error(exc.code, exc.message, exc.details)
+        raise typer.Exit(code=1) from exc
+    except ValidationError as exc:
+        _echo_validation_error(exc)
+        raise typer.Exit(code=1) from exc
+    except json.JSONDecodeError as exc:
+        _echo_error(E_REQ_INVALID, f"JSON 파싱 실패: {exc}")
+        raise typer.Exit(code=1) from exc
+    except OSError as exc:
+        _echo_error(E_REQ_INVALID, f"파일 처리 중 오류: {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @app.callback()
@@ -133,26 +167,40 @@ def build(
 ) -> None:
     """TwinInput -> Engine, 파일로 저장 (SPEC 10장, 4.1)."""
 
-    twin = TwinInput.model_validate_json(input.read_text(encoding="utf-8"))
-
-    as_of_date: date | None = None
-    if as_of is not None:
+    with _cli_error_guard():
         try:
-            as_of_date = date.fromisoformat(as_of)
-        except ValueError as exc:
-            _echo_error(E_REQ_RANGE, f"--as-of 가 올바른 날짜(YYYY-MM-DD)가 아니다: {as_of}")
+            input_text = input.read_text(encoding="utf-8")
+        except OSError as exc:
+            _echo_error(E_REQ_INVALID, f"입력 파일을 읽을 수 없다: {input} ({exc})")
             raise typer.Exit(code=1) from exc
 
-    try:
-        engine = build_engine(twin, as_of=as_of_date, strict=strict)
-    except FdtError as exc:
-        _echo_error(exc.code, exc.message, exc.details)
-        raise typer.Exit(code=1) from exc
+        try:
+            twin = TwinInput.model_validate_json(input_text)
+        except ValidationError as exc:
+            # JSON 파싱 실패(`json_invalid`)와 스키마/참조 위반(E-INPUT-*) 을
+            # 모두 여기서 잡는다: pydantic 은 두 경우 다 ValidationError 로
+            # 감싼다 (리뷰 N3).
+            _echo_validation_error(exc)
+            raise typer.Exit(code=1) from exc
 
-    save_engine(engine, out)
-    typer.echo(f"built engine {engine.meta.engine_id} (as_of={engine.meta.as_of}) -> {out}")
-    for warning in engine.meta.warnings:
-        typer.echo(f"warning: {warning.code} - {warning.message}")
+        as_of_date: date | None = None
+        if as_of is not None:
+            try:
+                as_of_date = date.fromisoformat(as_of)
+            except ValueError as exc:
+                _echo_error(E_REQ_RANGE, f"--as-of 가 올바른 날짜(YYYY-MM-DD)가 아니다: {as_of}")
+                raise typer.Exit(code=1) from exc
+
+        try:
+            engine = build_engine(twin, as_of=as_of_date, strict=strict)
+        except FdtError as exc:
+            _echo_error(exc.code, exc.message, exc.details)
+            raise typer.Exit(code=1) from exc
+
+        save_engine(engine, out)
+        typer.echo(f"built engine {engine.meta.engine_id} (as_of={engine.meta.as_of}) -> {out}")
+        for warning in engine.meta.warnings:
+            typer.echo(f"warning: {warning.code} - {warning.message}")
 
 
 def _format_krw(amount: int) -> str:
@@ -174,7 +222,7 @@ def _print_state_summary(engine) -> None:
             issued = sum(bill.amount for bill in card.issued_unpaid)
             typer.echo(
                 f"  [{card.id}] 미청구(unbilled)={_format_krw(card.unbilled)} "
-                f"미결제(issued_unpaid)={_format_krw(issued)}건수={len(card.issued_unpaid)}"
+                f"미결제(issued_unpaid)={_format_krw(issued)} 건수={len(card.issued_unpaid)}"
             )
 
     typer.echo("봉투(예산/사용/잔여):")
@@ -227,17 +275,18 @@ def inspect(
 ) -> None:
     """State/Behavior 요약 표 출력 (SPEC 10장)."""
 
-    try:
-        eng = load_engine(engine)
-    except FdtError as exc:
-        _echo_error(exc.code, exc.message, exc.details)
-        raise typer.Exit(code=1) from exc
+    with _cli_error_guard():
+        try:
+            eng = load_engine(engine)
+        except FdtError as exc:
+            _echo_error(exc.code, exc.message, exc.details)
+            raise typer.Exit(code=1) from exc
 
-    typer.echo("=== State ===")
-    _print_state_summary(eng)
-    typer.echo("")
-    typer.echo("=== Behavior ===")
-    _print_behavior_summary(eng)
+        typer.echo("=== State ===")
+        _print_state_summary(eng)
+        typer.echo("")
+        typer.echo("=== Behavior ===")
+        _print_behavior_summary(eng)
 
 
 @app.command(name="run")
@@ -260,48 +309,63 @@ def run_mode(
     `status=ERROR` 면 종료 코드 1 을 반환한다.
     """
 
-    try:
-        eng = load_engine(engine)
-    except FdtError as exc:
-        _echo_error(exc.code, exc.message, exc.details)
-        raise typer.Exit(code=1) from exc
+    with _cli_error_guard():
+        try:
+            eng = load_engine(engine)
+        except FdtError as exc:
+            _echo_error(exc.code, exc.message, exc.details)
+            raise typer.Exit(code=1) from exc
 
-    if params_file is not None:
-        params_raw = json.loads(params_file.read_text(encoding="utf-8"))
-    elif params is not None:
-        params_raw = json.loads(params)
-    else:
-        params_raw = {}
+        if params_file is not None:
+            try:
+                params_text = params_file.read_text(encoding="utf-8")
+            except OSError as exc:
+                _echo_error(
+                    E_REQ_INVALID, f"--params-file 을 읽을 수 없다: {params_file} ({exc})"
+                )
+                raise typer.Exit(code=1) from exc
+            try:
+                params_raw = json.loads(params_text)
+            except json.JSONDecodeError as exc:
+                _echo_error(E_REQ_INVALID, f"--params-file JSON 파싱 실패: {exc}")
+                raise typer.Exit(code=1) from exc
+        elif params is not None:
+            try:
+                params_raw = json.loads(params)
+            except json.JSONDecodeError as exc:
+                _echo_error(E_REQ_INVALID, f"--params JSON 파싱 실패: {exc}")
+                raise typer.Exit(code=1) from exc
+        else:
+            params_raw = {}
 
-    try:
-        request = ModeRequest.model_validate(
-            {
-                "mode": mode,
-                "horizon_days": horizon,
-                "n_paths": n_paths,
-                "seed": seed,
-                "params": params_raw,
-            }
+        try:
+            request = ModeRequest.model_validate(
+                {
+                    "mode": mode,
+                    "horizon_days": horizon,
+                    "n_paths": n_paths,
+                    "seed": seed,
+                    "params": params_raw,
+                }
+            )
+        except ValidationError as exc:
+            _echo_validation_error(exc)
+            raise typer.Exit(code=1) from exc
+
+        result = eng.run(request)
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-    except ValidationError as exc:
-        code = _extract_error_code(str(exc), E_REQ_INVALID)
-        _echo_error(code, str(exc))
-        raise typer.Exit(code=1) from exc
 
-    result = eng.run(request)
+        if result.status == "ERROR":
+            assert result.error is not None
+            typer.echo(f"ERROR {result.error.code}: {result.error.message}")
+            raise typer.Exit(code=1)
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(
-        json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    if result.status == "ERROR":
-        assert result.error is not None
-        typer.echo(f"ERROR {result.error.code}: {result.error.message}")
-        raise typer.Exit(code=1)
-
-    typer.echo(f"wrote {out}")
+        typer.echo(f"wrote {out}")
 
 
 if __name__ == "__main__":

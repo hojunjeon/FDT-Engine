@@ -2,9 +2,14 @@
 
 엔진에 들어오는 실행 요청 전체. 모드 선택은 요청자가 명시하며 엔진은
 추론하지 않는다(SPEC 8.1). 필수 파라미터 누락은 코드 `E-REQ-MISSING`,
-범위 밖은 `E-REQ-RANGE` 를 담은 메시지의 `ValueError`(pydantic 의
-`ValidationError` 는 `ValueError` 의 서브클래스)로 실패한다. 기본값으로
-조용히 대체하지 않는다.
+범위 밖은 `E-REQ-RANGE` 를 담은 `FdtError`(pydantic 의 `ValidationError` 가
+감싸는 `ValueError` 의 서브클래스)로 실패한다. 기본값으로 조용히 대체하지
+않는다.
+
+N1·N22·S39: 코드를 메시지 문자열에 태우던 옛 관례 대신 `FdtError(code=...,
+details=...)` 를 던진다. `ValidationError.errors(include_context=True)` 의
+`ctx["error"]` 로 원 예외를 그대로 꺼낼 수 있어(`fdt.engine.errors.
+extract_errors()`), 호출자가 메시지를 정규식으로 파싱할 필요가 없다.
 
 이 모듈의 공개 이름(`ModeRequest`, `ForecastParams`, `WhatIfParams`,
 `GoalParams`, `RiskParams`, `OptimizeParams`, `Injection` 각 서브타입)은
@@ -19,7 +24,7 @@ from typing import Annotated, Any, Literal, NoReturn
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 from fdt.engine import taxonomy
-from fdt.engine.errors import E_REQ_MISSING, E_REQ_RANGE
+from fdt.engine.errors import E_REQ_MISSING, E_REQ_RANGE, FdtError
 from fdt.engine.taxonomy import Mode
 
 AMOUNT_MIN = 0
@@ -32,8 +37,8 @@ class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _fail(code: str, message: str) -> NoReturn:
-    raise ValueError(f"{code}: {message}")
+def _fail(code: str, message: str, details: dict[str, Any] | None = None) -> NoReturn:
+    raise FdtError(code=code, message=message, details=details)
 
 
 def _require(cond: bool, code: str, message: str) -> None:

@@ -357,6 +357,7 @@ def _example_state_dict() -> dict:
         "cards": [
             {
                 "id": 20,
+                "withdrawal_account_id": 10,
                 "withdrawal_weekday": 1,
                 "unbilled": 92300,
                 "issued_unpaid": [{"billing_date": "2026-09-01", "amount": 183500}],

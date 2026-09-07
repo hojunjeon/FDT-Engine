@@ -557,6 +557,19 @@ _MODE_RESULT: dict[Mode, type[BaseModel]] = {
 }
 
 
+class ResultWarning(_Base):
+    """`EngineMeta.warnings` 항목 하나 (N16).
+
+    이전에는 `dataclasses.asdict(FdtWarning)` 로 평탄화한 스키마 없는
+    `dict[str, Any]` 였다 - `fdt validate`(W12) 가 검사할 계약이 없었다. 이제
+    `FdtWarning` 과 필드가 1:1 대응하는 pydantic 모델로 계약을 명시한다.
+    """
+
+    code: str
+    message: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class EngineMeta(_Base):
     engine_id: str
     as_of: date
@@ -566,7 +579,7 @@ class EngineMeta(_Base):
     horizon_days: int
     elapsed_ms: int
     engine_version: str
-    warnings: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[ResultWarning] = Field(default_factory=list)
 
 
 class EngineError(_Base):
@@ -677,6 +690,7 @@ __all__ = [
     "Recommended",
     "Required",
     "ResultUnion",
+    "ResultWarning",
     "RiskResult",
     "Stack",
     "StepBarsData",

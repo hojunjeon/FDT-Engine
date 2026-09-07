@@ -4,20 +4,23 @@ KeyFin ERD 테이블을 그대로 JSON 배열로 옮긴 형태를 1급 입력으
 모듈은 `fdt.engine.taxonomy` 의 공개 상수/열거형만 신뢰하고 그 값을 다시
 정의하지 않는다 (SPEC 4.2 불변 원칙, PLAN Phase 0 병렬 규칙).
 
-검증 오류는 전부 `ValueError` 로 내며 메시지에 `"<코드>: 상세"` 가 포함된다
-(SPEC 3.3). pydantic 이 `ValidationError` 를 만들며 앞에 필드 위치 정보를
-덧붙이므로 메시지가 코드로 "시작"하지는 않는다. 코드 문자열 자체는
-`fdt.engine.errors` 의 상수를 그대로 쓴다.
+검증 오류는 전부 `FdtError(code=..., details=...)` 로 낸다(N1·S39: 예전에는
+`ValueError(f"<코드>: 상세")` 로 코드를 메시지 문자열에 태웠으나, `FdtError`
+가 `ValueError` 의 서브클래스라 pydantic 은 여전히 이를 잡아
+`ValidationError` 로 감싼다 - 다만 이제는 `ValidationError.errors(
+include_context=True)[i]["ctx"]["error"]` 로 원 `FdtError` 를 그대로 꺼낼 수
+있어, `fdt.engine.errors.extract_errors()` 가 메시지 정규식 파싱 없이 코드를
+복원한다). 코드 문자열 자체는 `fdt.engine.errors` 의 상수를 그대로 쓴다.
 """
 
 from __future__ import annotations
 
 from datetime import date, time
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, NoReturn, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, model_validator
 
-from fdt.engine.errors import E_INPUT_DUP, E_INPUT_EMPTY, E_INPUT_REF, E_INPUT_TAXONOMY
+from fdt.engine.errors import E_INPUT_DUP, E_INPUT_EMPTY, E_INPUT_REF, E_INPUT_TAXONOMY, FdtError
 from fdt.engine.taxonomy import (
     ENVELOPE_IDS,
     ENVELOPES,
@@ -39,6 +42,10 @@ _SUBCATEGORY_SET: frozenset[tuple[int, int, str]] = frozenset(SUBCATEGORIES)
 _HasId = TypeVar("_HasId", bound=BaseModel)
 
 
+def _fail(code: str, message: str, details: dict[str, Any] | None = None) -> NoReturn:
+    raise FdtError(code=code, message=message, details=details)
+
+
 def _dedup_by_id(items: list[_HasId], label: str) -> list[_HasId]:
     """SPEC 3.1 "모든 배열은 id 유일" 을 배열 종류에 상관없이 강제한다.
 
@@ -58,7 +65,11 @@ def _dedup_by_id(items: list[_HasId], label: str) -> list[_HasId]:
             continue
         if existing == item:
             continue
-        raise ValueError(f"{E_INPUT_DUP}: {label} {item_id} 가 서로 다른 내용으로 중복됨")
+        _fail(
+            E_INPUT_DUP,
+            f"{label} {item_id} 가 서로 다른 내용으로 중복됨",
+            details={"label": label, "id": item_id},
+        )
     return deduped
 
 
@@ -264,10 +275,12 @@ class TwinInput(_Base):
                 for eid in set(got_envelopes) | set(_ENVELOPE_ID_TO_NAME)
                 if got_envelopes.get(eid) != _ENVELOPE_ID_TO_NAME.get(eid)
             )
-            raise ValueError(
-                f"{E_INPUT_TAXONOMY}: envelopes 의 id<->이름이 taxonomy.ENVELOPE_IDS 와 "
+            _fail(
+                E_INPUT_TAXONOMY,
+                f"envelopes 의 id<->이름이 taxonomy.ENVELOPE_IDS 와 "
                 f"일치하지 않는다 (불일치 id: {mismatched}, "
-                f"받은 값: {sorted(got_envelopes.items())})"
+                f"받은 값: {sorted(got_envelopes.items())})",
+                details={"mismatched_ids": mismatched},
             )
 
         # (2) 세분류는 22종이어야 하고 (id, envelope_id, name) 집합이
@@ -276,9 +289,11 @@ class TwinInput(_Base):
         if len(self.subcategories) != len(SUBCATEGORIES) or got_subs != _SUBCATEGORY_SET:
             missing = sorted(_SUBCATEGORY_SET - got_subs)
             extra = sorted(got_subs - _SUBCATEGORY_SET)
-            raise ValueError(
-                f"{E_INPUT_TAXONOMY}: subcategories 가 taxonomy.SUBCATEGORIES(22종) 와 "
-                f"일치하지 않는다 (누락: {missing}, 불일치/초과: {extra})"
+            _fail(
+                E_INPUT_TAXONOMY,
+                f"subcategories 가 taxonomy.SUBCATEGORIES(22종) 와 "
+                f"일치하지 않는다 (누락: {missing}, 불일치/초과: {extra})",
+                details={"missing": missing, "extra": extra},
             )
         return self
 
@@ -289,52 +304,104 @@ class TwinInput(_Base):
 
         for card in self.cards:
             if card.withdrawal_account_id not in account_ids:
-                raise ValueError(
-                    f"{E_INPUT_REF}: card {card.id} -> account "
-                    f"{card.withdrawal_account_id} 없음"
+                _fail(
+                    E_INPUT_REF,
+                    f"card {card.id} -> account {card.withdrawal_account_id} 없음",
+                    details={
+                        "ref_from": "card",
+                        "ref_from_id": card.id,
+                        "ref_to": "account",
+                        "ref_to_id": card.withdrawal_account_id,
+                    },
                 )
 
         for fx in self.fixed_expenses:
             if fx.withdrawal_account_id is not None and fx.withdrawal_account_id not in account_ids:
-                raise ValueError(
-                    f"{E_INPUT_REF}: fixed_expense {fx.id} -> account "
-                    f"{fx.withdrawal_account_id} 없음"
+                _fail(
+                    E_INPUT_REF,
+                    f"fixed_expense {fx.id} -> account {fx.withdrawal_account_id} 없음",
+                    details={
+                        "ref_from": "fixed_expense",
+                        "ref_from_id": fx.id,
+                        "ref_to": "account",
+                        "ref_to_id": fx.withdrawal_account_id,
+                    },
                 )
             if fx.card_id is not None and fx.card_id not in card_ids:
-                raise ValueError(
-                    f"{E_INPUT_REF}: fixed_expense {fx.id} -> card {fx.card_id} 없음"
+                _fail(
+                    E_INPUT_REF,
+                    f"fixed_expense {fx.id} -> card {fx.card_id} 없음",
+                    details={
+                        "ref_from": "fixed_expense",
+                        "ref_from_id": fx.id,
+                        "ref_to": "card",
+                        "ref_to_id": fx.card_id,
+                    },
                 )
 
         for loan in self.loans:
             if loan.withdrawal_account_id not in account_ids:
-                raise ValueError(
-                    f"{E_INPUT_REF}: loan {loan.id} -> account "
-                    f"{loan.withdrawal_account_id} 없음"
+                _fail(
+                    E_INPUT_REF,
+                    f"loan {loan.id} -> account {loan.withdrawal_account_id} 없음",
+                    details={
+                        "ref_from": "loan",
+                        "ref_from_id": loan.id,
+                        "ref_to": "account",
+                        "ref_to_id": loan.withdrawal_account_id,
+                    },
                 )
 
         for billing in self.card_billings:
             if billing.card_id not in card_ids:
-                raise ValueError(
-                    f"{E_INPUT_REF}: card_billing {billing.id} -> card "
-                    f"{billing.card_id} 없음"
+                _fail(
+                    E_INPUT_REF,
+                    f"card_billing {billing.id} -> card {billing.card_id} 없음",
+                    details={
+                        "ref_from": "card_billing",
+                        "ref_from_id": billing.id,
+                        "ref_to": "card",
+                        "ref_to_id": billing.card_id,
+                    },
                 )
 
         for tx in self.transactions:
             if tx.account_id is not None and tx.account_id not in account_ids:
-                raise ValueError(
-                    f"{E_INPUT_REF}: transaction {tx.id} -> account {tx.account_id} 없음"
+                _fail(
+                    E_INPUT_REF,
+                    f"transaction {tx.id} -> account {tx.account_id} 없음",
+                    details={
+                        "ref_from": "transaction",
+                        "ref_from_id": tx.id,
+                        "ref_to": "account",
+                        "ref_to_id": tx.account_id,
+                    },
                 )
             if tx.card_id is not None and tx.card_id not in card_ids:
-                raise ValueError(
-                    f"{E_INPUT_REF}: transaction {tx.id} -> card {tx.card_id} 없음"
+                _fail(
+                    E_INPUT_REF,
+                    f"transaction {tx.id} -> card {tx.card_id} 없음",
+                    details={
+                        "ref_from": "transaction",
+                        "ref_from_id": tx.id,
+                        "ref_to": "card",
+                        "ref_to_id": tx.card_id,
+                    },
                 )
             if (
                 tx.counterparty_account_id is not None
                 and tx.counterparty_account_id not in account_ids
             ):
-                raise ValueError(
-                    f"{E_INPUT_REF}: transaction {tx.id} -> account(counterparty) "
-                    f"{tx.counterparty_account_id} 없음"
+                _fail(
+                    E_INPUT_REF,
+                    f"transaction {tx.id} -> account(counterparty) "
+                    f"{tx.counterparty_account_id} 없음",
+                    details={
+                        "ref_from": "transaction",
+                        "ref_from_id": tx.id,
+                        "ref_to": "account",
+                        "ref_to_id": tx.counterparty_account_id,
+                    },
                 )
 
         return self
@@ -345,7 +412,7 @@ class TwinInput(_Base):
         # (SPEC 3.3, §5.3 PRIMARY 계좌 결정에 관리 계좌가 필요, 리뷰 N3).
         managed_accounts = sum(1 for a in self.accounts if a.is_managed)
         if managed_accounts == 0:
-            raise ValueError(f"{E_INPUT_EMPTY}: is_managed 계좌가 하나도 없음")
+            _fail(E_INPUT_EMPTY, "is_managed 계좌가 하나도 없음")
         return self
 
     # -- 헬퍼 -----------------------------------------------------------

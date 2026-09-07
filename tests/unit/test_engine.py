@@ -22,13 +22,20 @@ from fdt.engine.errors import (
     E_ENGINE_ID_MISMATCH,
     E_MODE_NOT_IMPLEMENTED,
     E_RECON,
+    E_REQ_MISSING,
+    E_REQ_RANGE,
     W_INPUT_FUTURE_TX,
     W_INPUT_SHORT_HISTORY,
     W_RECON,
     FdtError,
+    FdtWarning,
 )
+from fdt.engine.modes import MODE_RUNNERS
 from fdt.engine.schemas.request import ModeRequest
-from fdt.gen import PROFILE_NAMES
+from fdt.engine.schemas.result import ResultWarning
+from fdt.engine.taxonomy import Mode
+from fdt.gen import PROFILE_NAMES, generate
+from fdt.tools.engine_io import load_engine, save_engine
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SEED_DATA_ROOT = _REPO_ROOT / "data" / "seed"
@@ -104,6 +111,26 @@ def test_from_dict_rejects_mismatch_when_twin_content_changed(engines_3m):
     assert exc_info.value.code == E_ENGINE_ID_MISMATCH
 
 
+def test_save_load_run_roundtrip_matches_recomputed_engine(tmp_path, profiles_3m):
+    """N17: `save_engine -> load_engine -> run()` 결과가 그 자리에서 다시
+    `build_engine` 한 엔진의 `run()` 결과와 (`elapsed_ms` 제외) 바이트
+    동일해야 한다(PLAN Phase 2 완료 조건, 리뷰가 수동으로만 확인했던 항목).
+    """
+
+    twin, _gt = profiles_3m["D_goal_saver"]
+    recomputed_engine = build_engine(twin)
+
+    path = tmp_path / "engine.json"
+    save_engine(recomputed_engine, path)
+    loaded_engine = load_engine(path)
+
+    req = ModeRequest(mode="RISK", params={})
+    loaded_result = loaded_engine.run(req)
+    recomputed_result = recomputed_engine.run(req)
+
+    assert loaded_result.strip_volatile() == recomputed_result.strip_volatile()
+
+
 # ---------------------------------------------------------------------------
 # 경고 수집
 # ---------------------------------------------------------------------------
@@ -160,6 +187,73 @@ def test_strict_recon_raises_e_recon(profiles_3m):
 
 
 # ---------------------------------------------------------------------------
+# B1·B2 회귀: 홀드아웃(as_of < twin.as_of) 빌드에서 원장이 전체 기간이어야
+# 잔액 역산·대사가 맞는다 (리뷰 20260907_W3_W4_W5.md).
+# ---------------------------------------------------------------------------
+
+
+def test_holdout_build_no_future_leakage_without_opening_balance() -> None:
+    """`omit_opening_balance=True` 로 만든 입력을 `as_of=twin.as_of-30` 으로
+    홀드아웃 빌드하면, liquidity/emergency_fund 가 `ground_truth.daily_balance`
+    의 그 시점 값과 정확히 같아야 한다(B1). 고치기 전에는 `account_balance_at`
+    의 역산이 항상 0을 빼 `twin.as_of` 시점 잔액이 그대로 새어 나왔다.
+    """
+
+    twin, _twin_raw, gt = generate(
+        "B_card_crunch", seed=_SEED, months=3, omit_opening_balance=True
+    )
+    for account in twin.accounts:
+        assert account.opening_balance is None
+
+    holdout_as_of = twin.as_of - timedelta(days=30)
+    engine = build_engine(twin, as_of=holdout_as_of, strict=True)
+
+    day_snapshot = gt["daily_balance"][holdout_as_of.isoformat()]
+    expected_total = sum(
+        day_snapshot[str(account.id)] for account in twin.accounts if account.is_managed
+    )
+    actual_total = engine.state.liquidity + engine.state.emergency_fund
+    assert actual_total == expected_total, (
+        f"홀드아웃 as_of={holdout_as_of} liquidity+emergency_fund={actual_total} != "
+        f"ground_truth {expected_total} (B1 회귀: 미래 잔액 누수)"
+    )
+
+    codes = [w.code for w in engine.meta.warnings]
+    assert W_RECON not in codes, f"B2 회귀: 과거 as_of 빌드에 가짜 W-RECON 이 떴다: {codes}"
+    assert W_INPUT_FUTURE_TX in codes, "as_of 이후 거래가 있는데 W-INPUT-FUTURE_TX 가 없다"
+
+
+def test_holdout_build_strict_succeeds_for_past_as_of() -> None:
+    """B2 회귀: `--strict` 로 과거 as_of 홀드아웃 엔진을 만들 수 있어야 한다.
+
+    고치기 전에는 `reconcile` 이 절단된 원장을 `twin.as_of` 잔액과 대사해
+    모든 과거 as_of 빌드가 `strict=True` 에서 `FdtError(E-RECON)` 로 실패했다.
+    """
+
+    twin, _twin_raw, _gt = generate("B_card_crunch", seed=_SEED, months=3)
+    holdout_as_of = twin.as_of - timedelta(days=30)
+
+    engine = build_engine(twin, as_of=holdout_as_of, strict=True)
+
+    assert engine.meta.as_of == holdout_as_of
+    codes = [w.code for w in engine.meta.warnings]
+    assert W_RECON not in codes
+
+
+# ---------------------------------------------------------------------------
+# N7: as_of > twin.as_of -> E-REQ-RANGE
+# ---------------------------------------------------------------------------
+
+
+def test_as_of_after_twin_as_of_raises_e_req_range(profiles_3m):
+    twin, _gt = profiles_3m["A_steady"]
+
+    with pytest.raises(FdtError) as exc_info:
+        build_engine(twin, as_of=twin.as_of + timedelta(days=1))
+    assert exc_info.value.code == E_REQ_RANGE
+
+
+# ---------------------------------------------------------------------------
 # fork
 # ---------------------------------------------------------------------------
 
@@ -173,6 +267,25 @@ def test_fork_copies_state_and_shares_ledger(engines_3m):
 
     forked.state.liquidity = engine.state.liquidity + 999999
     assert forked.state.liquidity != engine.state.liquidity
+
+
+def test_fork_meta_warnings_are_independent(engines_3m):
+    """N15: `fork()` 가 `meta` 를 공유하면 분기에서 경고를 추가할 때 기준
+    엔진이 오염된다. `meta`(와 그 `warnings` 리스트)도 복사해야 한다."""
+
+    engine = engines_3m["B_card_crunch"]
+    original_warning_count = len(engine.meta.warnings)
+
+    forked = engine.fork()
+    assert forked.meta is not engine.meta
+    assert forked.meta.warnings is not engine.meta.warnings
+
+    forked.meta.warnings.append(FdtWarning(code="W-TEST-FORK-ONLY"))
+
+    assert len(engine.meta.warnings) == original_warning_count, (
+        "fork 에서 추가한 경고가 원본 엔진의 meta.warnings 를 오염시켰다"
+    )
+    assert len(forked.meta.warnings) == original_warning_count + 1
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +307,57 @@ def test_run_returns_error_result_for_unimplemented_mode_without_raising(engines
     assert result.error.code == E_MODE_NOT_IMPLEMENTED
     assert result.meta.engine_id == engine.meta.engine_id
     assert result.meta.mode.value == "FORECAST"
+
+
+def test_run_meta_warnings_are_typed_result_warnings(profiles_3m):
+    """N16: `EngineMeta.warnings` 가 스키마 없는 `dict[str, Any]` 로 붕괴하지
+    않고 `ResultWarning` 모델이어야 한다(`fdt validate`(W12)가 검사할 계약).
+    """
+
+    twin, _gt = profiles_3m["B_card_crunch"]
+    engine = build_engine(twin, as_of=twin.as_of - timedelta(days=30))
+    assert engine.meta.warnings, "이 테스트는 경고가 최소 1건 있어야 의미가 있다"
+
+    req = ModeRequest(mode="FORECAST", params={})
+    result = engine.run(req)
+
+    assert len(result.meta.warnings) == len(engine.meta.warnings)
+    for warning in result.meta.warnings:
+        assert isinstance(warning, ResultWarning)
+        assert isinstance(warning.code, str) and warning.code
+    codes = [w.code for w in result.meta.warnings]
+    assert codes == [w.code for w in engine.meta.warnings]
+
+
+def test_run_wraps_validation_error_via_extract_errors(monkeypatch, engines_3m):
+    """N1·N22·S39: 모드 러너 안에서 난 `pydantic.ValidationError` 는
+    `extract_errors()` 로 구조화돼야 한다 - 메시지 정규식 파싱이 아니라
+    `ctx["error"]`(우리가 던진 `FdtError`)를 그대로 복원해 `E-REQ-MISSING`
+    같은 정확한 코드가 나와야 한다(GOAL 의 BALANCE 는 target_amount/
+    target_date 를 요구하는 `FdtError(E-REQ-MISSING)` validator 가 있음).
+    """
+
+    engine = engines_3m["A_steady"]
+
+    def _raiser(_engine: Engine, _req: ModeRequest):
+        # target_amount/target_date 없이 goal_type=BALANCE 를 검증해 일부러
+        # `FdtError(E-REQ-MISSING)` 를 담은 `ValidationError` 를 일으킨다.
+        ModeRequest.model_validate({"mode": "GOAL", "params": {"goal_type": "BALANCE"}})
+        raise AssertionError("ModeRequest.model_validate 가 실패했어야 한다")
+
+    monkeypatch.setitem(MODE_RUNNERS, Mode.GOAL, _raiser)
+    req = ModeRequest(mode="GOAL", params={"goal_type": "ENVELOPE_ADHERE"})
+
+    result = engine.run(req)
+
+    assert result.status == "ERROR"
+    assert result.error is not None
+    assert result.error.code == E_REQ_MISSING
+    assert "errors" in result.error.details
+    assert result.error.details["errors"], "errors 목록이 비어있음"
+    for entry in result.error.details["errors"]:
+        assert entry["code"] == E_REQ_MISSING
+        assert entry["message"]
 
 
 def test_run_does_not_raise_for_every_mode(engines_3m):

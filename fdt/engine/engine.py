@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -26,21 +27,21 @@ from fdt.engine.behavior import detect_income_schedule, estimate_behavior
 from fdt.engine.errors import (
     E_ENGINE_ID_MISMATCH,
     E_MODE_NOT_IMPLEMENTED,
-    E_REQ_INVALID,
     E_REQ_RANGE,
     W_INPUT_FUTURE_TX,
     W_INPUT_SHORT_HISTORY,
     FdtError,
     FdtWarning,
+    extract_errors,
 )
-from fdt.engine.ledger import LedgerTx, history_days, normalize, reconcile
+from fdt.engine.ledger import LedgerTx, account_balance_at, history_days, normalize, reconcile
 from fdt.engine.modes import MODE_RUNNERS
 from fdt.engine.schemas.behavior import Behavior
 from fdt.engine.schemas.input import Externals, TwinInput
 from fdt.engine.schemas.request import ModeRequest
 from fdt.engine.schemas.result import EngineError as ResultEngineError
 from fdt.engine.schemas.result import EngineMeta as ResultEngineMeta
-from fdt.engine.schemas.result import EngineResult
+from fdt.engine.schemas.result import EngineResult, ResultWarning
 from fdt.engine.schemas.state import State
 from fdt.engine.state import build_state_with_warnings
 from fdt.engine.taxonomy import ConfirmStatus, ExcludeTag, Flow
@@ -137,10 +138,24 @@ class Engine:
     externals: Externals
 
     def fork(self) -> Engine:
-        """What-if 용 얕은 복제 (SPEC 4.1). 원장은 공유(불변), state 만 깊은 복사."""
+        """What-if 용 얕은 복제 (SPEC 4.1). 원장은 공유(불변), state 만 깊은 복사.
 
+        N15: `meta` 도 얕은 공유가 아니라 새 `EngineBuildMeta` 로 복사한다.
+        `warnings` 는 가변 리스트라 원본과 공유하면 분기 쪽에서 경고를
+        추가할 때 원본(기준) 엔진이 오염된다(W6 메모 7). 다른 필드는 전부
+        불변(str/date)이라 얕은 복사로 충분하다.
+        """
+
+        forked_meta = EngineBuildMeta(
+            engine_id=self.meta.engine_id,
+            as_of=self.meta.as_of,
+            schema_version=self.meta.schema_version,
+            engine_version=self.meta.engine_version,
+            warnings=list(self.meta.warnings),
+            budgets_override=self.meta.budgets_override,
+        )
         return Engine(
-            meta=self.meta,
+            meta=forked_meta,
             twin=self.twin,
             ledger=self.ledger,
             state=self.state.model_copy(deep=True),
@@ -173,15 +188,27 @@ class Engine:
             status = "ERROR"
             error = ResultEngineError(code=exc.code, message=exc.message, details=exc.details)
         except ValidationError as exc:
+            # N1·N22·S39: 메시지를 정규식으로 파싱하지 않는다.
+            # `extract_errors` 가 각 오류 항목을 구조화된 `FdtError` 로
+            # 복원한다(코드가 `E-REQ-MISSING`/`E-REQ-RANGE`/`E-REQ-INVALID`
+            # 로 정확히 갈린다 - SPEC 8.1). 첫 오류를 대표 `error` 로 삼고,
+            # 전체 목록은 `error.details["errors"]` 에 싣는다.
             status = "ERROR"
+            fdt_errors = extract_errors(exc)
+            first = fdt_errors[0]
             error = ResultEngineError(
-                code=E_REQ_INVALID,
-                message=str(exc),
+                code=first.code,
+                message=first.message,
                 details={
+                    **first.details,
                     "errors": [
-                        {"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]}
-                        for e in exc.errors()
-                    ]
+                        {
+                            "code": e.code,
+                            "message": e.message,
+                            "loc": e.details.get("loc"),
+                        }
+                        for e in fdt_errors
+                    ],
                 },
             )
 
@@ -195,7 +222,10 @@ class Engine:
             horizon_days=req.horizon_days,
             elapsed_ms=elapsed_ms,
             engine_version=self.meta.engine_version,
-            warnings=[asdict(w) for w in self.meta.warnings],
+            warnings=[
+                ResultWarning(code=w.code, message=w.message, details=w.details)
+                for w in self.meta.warnings
+            ],
         )
         return EngineResult(
             meta=result_meta,
@@ -304,15 +334,33 @@ def build_engine(
        `ledger.future_tx_count(twin)` 은 `twin.as_of` 고정 기준이라 `as_of`
        를 앞으로 당겨 만든 홀드아웃 스냅샷에서는 놓치므로, 여기서는
        `twin.transactions_until(as_of)` 와의 차이로 직접 센다.
-    3. `ledger.normalize(twin, as_of)` 로 원장을 만든다.
-    4. `ledger.reconcile(strict=strict)` 경고를 모은다(`strict=True` 면
-       내부에서 바로 `FdtError(E-RECON)` 를 던진다).
-    5. `history_days(ledger) < 28` 이면 `W-INPUT-SHORT_HISTORY`.
-    6. `detect_income_schedule` 로 수입 일정을 추정한다.
-    7. `build_state_with_warnings` 로 State 를 만들고, 그 봉투 예산을
-       `estimate_behavior` 에 넘긴다(예산 소스 우선순위는 State 담당).
-    8. `engine_id` 를 계산한다.
-    9. `externals` 는 twin 것을 그대로 쓴다.
+    3. `ledger.normalize(twin, as_of=twin.as_of)` 로 **전체 기간** 원장을
+       만든다(B1·B2, 리뷰 20260907_W3_W4_W5.md). 이전에는 `as_of=effective_as_of`
+       로 원장을 이 시점에 잘라, `account_balance_at`/`reconcile` 이 그
+       잘린 원장을 "전체 기간" 인 것처럼 읽어 (a) `opening_balance` 가 없는
+       계좌의 역산이 `as_of` 초과 구간을 못 찾아 항상 0을 빼는 미래 잔액
+       누수, (b) 과거 `as_of` 홀드아웃 빌드가 늘 가짜 `W-RECON`/`E-RECON`
+       을 내는 두 버그를 만들었다.
+    4. `ledger.reconcile(strict=strict)` 을 **전체 기간 원장**·`twin.as_of`
+       기준으로 수행해 경고를 모은다(`strict=True` 면 내부에서 바로
+       `FdtError(E-RECON)` 를 던진다) - 대사는 그 정의상 항상 `twin.as_of`
+       시점 진짜 잔액과 맞춰야 하므로 `effective_as_of` 와 무관하다.
+    5. 저장·이후 계산에 쓸 원장은 전체 기간 원장을 `effective_as_of` 이하로
+       절단한 튜플이다(`Engine.ledger` 계약 - 모드 러너는 이 절단 원장만
+       본다, W6 메모 8). `history_days`/`detect_income_schedule`/
+       `estimate_behavior` 는 전부 이 절단 원장만 봐서 미래 데이터가 새지
+       않는다.
+    6. `history_days(ledger) < 28` 이면 `W-INPUT-SHORT_HISTORY`.
+    7. `detect_income_schedule` 로 수입 일정을 추정한다.
+    8. `build_state_with_warnings` 로 State 를 만든다. **전체 기간 원장**을
+       넘겨야 `account_balance_at` 의 역산(opening_balance 없는 계좌)이
+       정확하다 - `state.py` 내부의 모든 다른 계산(큐·카드·봉투·지표)은
+       `_ledger_until(ledger, as_of)` 로 스스로 `effective_as_of` 까지
+       다시 걸러 쓰므로 전체 기간 원장을 받아도 미래가 새지 않는다. 그
+       봉투 예산은 `estimate_behavior` 에 넘긴다(예산 소스 우선순위는
+       State 담당).
+    9. `engine_id` 를 계산한다.
+    10. `externals` 는 twin 것을 그대로 쓴다.
     """
 
     effective_as_of = as_of if as_of is not None else twin.as_of
@@ -332,8 +380,12 @@ def build_engine(
     if future_count > 0:
         warnings.append(FdtWarning(code=W_INPUT_FUTURE_TX, details={"count": future_count}))
 
-    ledger = normalize(twin, as_of=effective_as_of)
-    warnings.extend(reconcile(twin, ledger, strict=strict))
+    # B1·B2: 대사·잔액 역산은 항상 전체 기간 원장을 봐야 한다.
+    full_ledger = normalize(twin, as_of=twin.as_of)
+    warnings.extend(reconcile(twin, full_ledger, strict=strict))
+
+    # `Engine.ledger` 계약: as_of 이하로 절단한 튜플만 저장·전파한다.
+    ledger = tuple(record for record in full_ledger if record.date <= effective_as_of)
 
     n_history_days = history_days(ledger)
     if n_history_days < 28:
@@ -343,13 +395,34 @@ def build_engine(
 
     income = detect_income_schedule(ledger, effective_as_of)
 
-    state, queue_warnings = build_state_with_warnings(
-        twin,
-        ledger,
-        as_of=effective_as_of,
-        budgets_override=budgets_override,
-        income=income,
-    )
+    # `build_state_with_warnings` 가 잔액을 자체 계산(`account_balance_at`)
+    # 하므로 전체 기간 원장을 넘겨야 opening_balance 없는 계좌의 역산이
+    # 맞는다. H2 가 별도로 `account_balances` 인자를 추가하기로 했다면
+    # 그쪽을 쓰고, 아직 없으면(2026-09-07 기준 없음) full_ledger 를 그대로
+    # 넘기는 우회로 충분하다 - 나머지 state 계산은 내부에서 스스로
+    # `effective_as_of` 로 다시 필터한다(B1 우회 방식, 보고 참조).
+    state_params = inspect.signature(build_state_with_warnings).parameters
+    if "account_balances" in state_params:
+        account_balances = {
+            account.id: account_balance_at(twin, full_ledger, account.id, effective_as_of)
+            for account in twin.accounts
+        }
+        state, queue_warnings = build_state_with_warnings(
+            twin,
+            ledger,
+            as_of=effective_as_of,
+            budgets_override=budgets_override,
+            income=income,
+            account_balances=account_balances,
+        )
+    else:
+        state, queue_warnings = build_state_with_warnings(
+            twin,
+            full_ledger,
+            as_of=effective_as_of,
+            budgets_override=budgets_override,
+            income=income,
+        )
     warnings.extend(queue_warnings)
 
     budgets = {envelope.envelope_id: envelope.budget for envelope in state.envelopes}

@@ -135,4 +135,148 @@ def test_build_missing_input_file_reports_error(tmp_path: Path) -> None:
             str(engine_path),
         ],
     )
-    assert result.exit_code != 0
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "ERROR"
+    assert payload["error"]["code"]
+    assert not engine_path.exists()
+
+
+def _build_engine(tmp_path: Path) -> Path:
+    engine_path = tmp_path / "A.engine.json"
+    build_result = runner.invoke(
+        app,
+        ["build", "--input", str(_SEED_TWIN_INPUT), "--out", str(engine_path)],
+    )
+    assert build_result.exit_code == 0, build_result.output
+    return engine_path
+
+
+def test_run_invalid_params_json_exits_one_with_req_invalid(tmp_path: Path) -> None:
+    engine_path = _build_engine(tmp_path)
+    result_path = tmp_path / "out.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--engine",
+            str(engine_path),
+            "--mode",
+            "FORECAST",
+            "--params",
+            "{oops",
+            "--out",
+            str(result_path),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ERROR"
+    assert payload["error"]["code"] == "E-REQ-INVALID"
+    assert not result_path.exists()
+
+
+def test_run_missing_params_file_exits_one(tmp_path: Path) -> None:
+    engine_path = _build_engine(tmp_path)
+    result_path = tmp_path / "out.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--engine",
+            str(engine_path),
+            "--mode",
+            "FORECAST",
+            "--params-file",
+            str(tmp_path / "does_not_exist.json"),
+            "--out",
+            str(result_path),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ERROR"
+    assert not result_path.exists()
+
+
+def test_build_input_schema_violation_exits_one_with_input_ref(tmp_path: Path) -> None:
+    twin = json.loads(_SEED_TWIN_INPUT.read_text(encoding="utf-8"))
+    # 카드가 참조하는 계좌를 지워 E-INPUT-REF 를 유발한다.
+    referenced_account_ids = {c["withdrawal_account_id"] for c in twin["cards"]}
+    twin["accounts"] = [a for a in twin["accounts"] if a["id"] not in referenced_account_ids]
+
+    broken_input = tmp_path / "broken_twin_input.json"
+    broken_input.write_text(json.dumps(twin, ensure_ascii=False), encoding="utf-8")
+
+    engine_path = tmp_path / "A.engine.json"
+    result = runner.invoke(
+        app,
+        ["build", "--input", str(broken_input), "--out", str(engine_path)],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ERROR"
+    assert payload["error"]["code"] == "E-INPUT-REF"
+    assert not engine_path.exists()
+
+
+def test_run_goal_mode_missing_params_exits_one_with_req_missing(tmp_path: Path) -> None:
+    engine_path = _build_engine(tmp_path)
+    result_path = tmp_path / "out.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--engine",
+            str(engine_path),
+            "--mode",
+            "GOAL",
+            "--out",
+            str(result_path),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ERROR"
+    # 정규식 코드 추출 없이, ModeRequest 검증기가 던진 FdtError 를 그대로
+    # extract_errors() 로 복원한 코드여야 한다 (리뷰 N4).
+    assert payload["error"]["code"] == "E-REQ-MISSING"
+    assert not result_path.exists()
+
+
+def test_run_horizon_and_n_paths_out_of_range_reports_both_errors(tmp_path: Path) -> None:
+    engine_path = _build_engine(tmp_path)
+    result_path = tmp_path / "out.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--engine",
+            str(engine_path),
+            "--mode",
+            "FORECAST",
+            "--horizon",
+            "400",
+            "--n-paths",
+            "50",
+            "--out",
+            str(result_path),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ERROR"
+    assert payload["error"]["code"] == "E-REQ-RANGE"
+    errors = payload["error"]["details"]["errors"]
+    assert len(errors) == 2
+    assert {e["code"] for e in errors} == {"E-REQ-RANGE"}
+    assert not result_path.exists()

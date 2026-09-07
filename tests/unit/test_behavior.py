@@ -271,6 +271,79 @@ def test_elasticity_reacts_when_budget_runs_low_within_month():
     assert env.elasticity == pytest.approx(0.5)
 
 
+def test_essential_envelope_elasticity_clipped_within_narrow_bounds(profile_behavior):
+    """N11/S41: 필수 봉투(교통비/의료·건강/편의점·마트·잡화)는 탄력도가
+    [0.8, 1.2] 안에 있어야 한다(4 프로필 전부)."""
+
+    _name, _twin, _led, _gt, beh = profile_behavior
+    for env in beh.envelopes:
+        if env.envelope_id in _ESSENTIAL_IDS:
+            assert 0.8 <= env.elasticity <= 1.2, (env.envelope_id, env.elasticity)
+
+
+# ---------------------------------------------------------------------------
+# 4b. N14/S43: 봉투 금액 추정(amount_mu/sigma)과 daily_rate 는 돌발 제외
+# ---------------------------------------------------------------------------
+
+
+def test_envelope_amount_estimate_excludes_shock_classified_records():
+    as_of = date(2026, 9, 7)
+    records = []
+    rid = 1
+    for i in range(29):
+        records.append(
+            make_tx(rid, as_of - timedelta(days=i), envelope_id=_YOSIK_ID, amount=10_000)
+        )
+        rid += 1
+    # 돌발 1건: 1차 예비 mu 로 정한 임계(약 61,525원)를 훌쩍 넘는 금액.
+    records.append(
+        make_tx(rid, as_of - timedelta(days=29), envelope_id=_YOSIK_ID, amount=5_000_000)
+    )
+
+    beh = estimate_behavior(tuple(records), as_of, budgets=_flat_budgets())
+    env = next(e for e in beh.envelopes if e.envelope_id == _YOSIK_ID)
+
+    # 돌발 1건이 봉투 표본(n_obs)과 daily_rate/amount_mu 추정에서 제외된다.
+    assert env.n_obs == 29
+    assert env.amount_mu == pytest.approx(math.log(10_000))
+    assert env.amount_sigma == pytest.approx(0.2)
+    assert env.daily_rate == pytest.approx(29 / 30)
+
+
+# ---------------------------------------------------------------------------
+# 4c. N21: 이력 < 28일이면 봉투 pooled 전환 기준을 5 -> 10 으로 올린다
+# ---------------------------------------------------------------------------
+
+
+def test_short_history_raises_pooled_threshold_to_ten():
+    as_of = date(2026, 9, 7)
+    transport_id = ENVELOPE_IDS["교통비"]
+    records = []
+    rid = 1
+    # 이력 10일 (< 28일 -> short_history) 안에 봉투당 7건(>=5, <10) 씩.
+    for i in range(7):
+        records.append(
+            make_tx(rid, as_of - timedelta(days=i), envelope_id=_YOSIK_ID, amount=5_000)
+        )
+        rid += 1
+    for i in range(7):
+        records.append(
+            make_tx(rid, as_of - timedelta(days=i), envelope_id=transport_id, amount=50_000)
+        )
+        rid += 1
+
+    beh = estimate_behavior(tuple(records), as_of, budgets=_flat_budgets())
+    assert beh.window_days < 28
+    yosik = next(e for e in beh.envelopes if e.envelope_id == _YOSIK_ID)
+    transport = next(e for e in beh.envelopes if e.envelope_id == transport_id)
+
+    assert yosik.n_obs == 7
+    # short_history 라 n_e(7) < 10 -> pooled(전체 14건) 로 대체되어, 봉투
+    # 단독(5,000원) mu 와 달라야 한다.
+    assert yosik.amount_mu == pytest.approx(transport.amount_mu)
+    assert yosik.amount_mu != pytest.approx(math.log(5_000))
+
+
 # ---------------------------------------------------------------------------
 # 5. payday_boost / pre_payday_damp
 # ---------------------------------------------------------------------------
@@ -288,6 +361,45 @@ def test_payday_boost_default_when_no_income_events():
 
 
 def test_payday_boost_and_pre_payday_damp_clip_to_bounds():
+    """수입 간격 31일(>=12, N12/S35 겹침 없음)이면 두 값 모두 추정한다."""
+
+    as_of = date(2026, 9, 7)
+    window_start = as_of - timedelta(days=89)
+    income_days = []
+    d = as_of
+    while d >= window_start:
+        income_days.append(d)
+        d -= timedelta(days=31)
+
+    records = []
+    rid = 1
+    for idx, iday in enumerate(income_days):
+        records.append(
+            make_tx(1000 + idx, iday, amount=1_000_000, flow=Flow.INCOME, account_id=10)
+        )
+
+    d = window_start
+    while d <= as_of:
+        is_before = any(1 <= (iday - d).days <= 5 for iday in income_days)
+        amount = 50_000 if is_before else 1_000
+        records.append(make_tx(rid, d, envelope_id=_YOSIK_ID, amount=amount))
+        rid += 1
+        d += timedelta(days=1)
+
+    beh = estimate_behavior(tuple(records), as_of, budgets=_flat_budgets(1_000_000), window_days=90)
+    assert beh.income.irregular is False
+    assert beh.income.median_gap_days == 31
+    # 급여일 당일 소비가 작아 boost 는 하한(0.7), 급여 전 5일 소비가 커서
+    # damp 는 상한(1.3) 으로 각각 클립된다.
+    assert beh.payday_boost == pytest.approx(0.7)
+    assert beh.pre_payday_damp == pytest.approx(1.3)
+
+
+def test_payday_windows_overlap_forces_damp_to_one():
+    """N12/S35: 수입 간격이 12일 미만이면 pre_payday_damp 는 1.0 으로
+    고정하고(추정하지 않음), payday_boost 는 겹치는 "급여 전" 날을 분모·
+    분자에서 제외하고 추정한다."""
+
     as_of = date(2026, 9, 7)
     window_start = as_of - timedelta(days=89)
     income_days = []
@@ -312,10 +424,9 @@ def test_payday_boost_and_pre_payday_damp_clip_to_bounds():
         d += timedelta(days=1)
 
     beh = estimate_behavior(tuple(records), as_of, budgets=_flat_budgets(1_000_000), window_days=90)
-    # 급여일 당일 소비가 작아 boost 는 하한(0.7), 급여 전 5일 소비가 커서
-    # damp 는 상한(1.3) 으로 각각 클립된다.
-    assert beh.payday_boost == pytest.approx(0.7)
-    assert beh.pre_payday_damp == pytest.approx(1.3)
+    assert beh.income.median_gap_days is not None
+    assert beh.income.median_gap_days < 12
+    assert beh.pre_payday_damp == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

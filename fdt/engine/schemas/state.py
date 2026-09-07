@@ -36,6 +36,8 @@ class IssuedBilling(_Base):
 class CardState(_Base):
     id: int
     withdrawal_weekday: int = Field(ge=0, le=6)
+    withdrawal_account_id: int  # S33: 청구 발행/카드 출금 단계에서 큐에 없는
+    # 새 청구서를 만들 때도 출금 계좌를 알아야 하므로 twin.cards 에서 옮겨온다.
     unbilled: int
     issued_unpaid: list[IssuedBilling] = Field(default_factory=list)
 
@@ -55,6 +57,9 @@ class Committed(_Base):
         "INSURANCE",
         "TELECOM",
         "SELF_TRANSFER",
+        "DETECTED_FIXED",  # S31: 원장 탐지 반복 고정비 전용(구독료로 오분류
+        # 방지). fixed_expenses/loans[]/cards[] 에서 이미 만든 항목이 아닌,
+        # 원장에서 직접 탐지한 일반 반복 고정비만 이 kind 를 쓴다.
     ]
     name: str
     due: date
@@ -62,6 +67,12 @@ class Committed(_Base):
     certainty: float = Field(ge=0, le=1)
     account_id: int | None = None
     card_id: int | None = None
+    # S32: 큐 항목이 어느 입력 레코드에서 왔는지(§8.3 FIXED_CHANGE 등의 개입이
+    # name 매칭을 재발명하지 않도록). 원장 탐지·SELF_TRANSFER 항목은 대응하는
+    # 입력 레코드가 없으므로 전부 None 이다.
+    source_fixed_expense_id: int | None = None
+    source_loan_id: int | None = None
+    source_card_id: int | None = None
 
 
 # ---------------------------------------------------------------------------

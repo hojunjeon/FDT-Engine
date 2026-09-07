@@ -9,8 +9,13 @@
 공개 함수 (다른 작업 ID 가 import 하는 계약):
 
 - `build_state(twin, ledger, *, as_of=None, budgets_override=None, income=None,
-  horizon_cap=90) -> State`
-- `build_state_with_warnings(...) -> tuple[State, list[FdtWarning]]`
+  horizon_cap=90, account_balances=None) -> State`
+- `build_state_with_warnings(..., account_balances=None) -> tuple[State, list[FdtWarning]]`
+  (`account_balances`: 리뷰 B1 대응. `{account_id: balance}` 를 주면 그 계좌는
+  `ledger_mod.account_balance_at` 재계산 없이 그 값을 그대로 쓴다. 홀드아웃
+  빌드에서 원장이 `as_of` 로 잘린 뒤 `account_balance_at` 의 역산 분기가
+  깨지는 문제를 우회하기 위해 `build_engine`(H1)이 원장을 자르기 전에 계산한
+  잔액을 여기로 주입한다.)
 - `build_committed_queue(twin, ledger, as_of, cards, horizon_cap=90) -> list[Committed]`
 - `propose_budgets(ledger, as_of) -> dict[int, int]`
 
@@ -81,10 +86,12 @@ _FIXED_ROW_KIND_MAP: dict[FixedExpenseType, _FixedRowKind] = {
     FixedExpenseType.SUBSCRIPTION: "SUBSCRIPTION",
 }
 
-# 원장 탐지 반복 고정비에 붙일 kind. Committed.kind 열거형에 "탐지된 일반
-# 고정비" 전용 값이 없어(SPEC 5.1) 의미가 가장 가까운 SUBSCRIPTION 을 쓴다
-# (구현 결정, 보고서에 명시).
-_DETECTED_FIXED_KIND: _FixedRowKind = "SUBSCRIPTION"
+# 원장 탐지 반복 고정비에 붙일 kind. 리뷰 B3/S31: 이전에는 Committed.kind
+# 열거형에 전용 값이 없어(SPEC 5.1) SUBSCRIPTION 으로 매핑했는데, 그 결과
+# loans[]/fixed_expenses 에서 이미 만든 항목과 (kind, name, due, amount) dedup
+# 키가 겹치지 않아 대출이자·관리비가 "구독료"로 이중 계상됐다. 이제
+# Committed.kind 에 DETECTED_FIXED 전용 값을 추가했으므로 그것을 쓴다.
+_DETECTED_FIXED_KIND: Literal["DETECTED_FIXED"] = "DETECTED_FIXED"
 
 # 대출 원리금균등(AMORTIZING) 상환액 계산에 쓰는 가정 상환 개월수.
 # `LoanIn` 스키마에 잔여 상환 개월(term)이 없어(SPEC 3.2) 표준 연금 공식을
@@ -187,8 +194,21 @@ def _primary_account_id(twin: TwinInput, ledger_until: tuple[LedgerTx, ...]) -> 
 
 
 def _build_accounts_and_balances(
-    twin: TwinInput, ledger: tuple[LedgerTx, ...], as_of: date
+    twin: TwinInput,
+    ledger: tuple[LedgerTx, ...],
+    as_of: date,
+    account_balances: dict[int, int] | None = None,
 ) -> tuple[list[AccountState], int, int]:
+    """계좌별 잔액과 PRIMARY/EMERGENCY 역할을 계산한다.
+
+    `account_balances` 가 주어지면(H1 `build_engine` 홀드아웃 경로) 그 계좌의
+    잔액은 자체 역산(`ledger_mod.account_balance_at`) 대신 그대로 신뢰한다.
+    `build_engine` 이 원장을 `as_of` 로 자른 뒤에는 `account_balance_at` 의
+    `opening_balance is None` 역산 분기가 잘린 구간을 못 봐 항상 0을 빼는
+    문제(리뷰 B1)가 있어, 호출자가 원장이 잘리기 전에 계산한 잔액을 주입할 수
+    있게 한다.
+    """
+
     ledger_upto = _ledger_until(ledger, as_of)
     primary_id = _primary_account_id(twin, ledger_upto)
 
@@ -196,7 +216,10 @@ def _build_accounts_and_balances(
     liquidity = 0
     emergency_fund = 0
     for account in twin.accounts:
-        balance = ledger_mod.account_balance_at(twin, ledger, account.id, as_of)
+        if account_balances is not None and account.id in account_balances:
+            balance = account_balances[account.id]
+        else:
+            balance = ledger_mod.account_balance_at(twin, ledger, account.id, as_of)
         role: _AccountRole
         if not account.is_managed:
             role = "OTHER"
@@ -239,7 +262,16 @@ def _card_unbilled(ledger_upto: tuple[LedgerTx, ...], card_id: int, as_of: date)
 def _reconstruct_issued_unpaid_from_billings(
     twin: TwinInput, card_id: int, as_of: date
 ) -> list[IssuedBilling] | None:
-    """`card_billings` 기반 재구성. 이 카드의 청구서가 하나도 없으면 `None`."""
+    """`card_billings` 기반 재구성. 이 카드의 청구서가 하나도 없으면 `None`.
+
+    S28: SPEC 5.3 문구는 `card_billings[status=UNPAID, billing_date <= as_of]`
+    라고 적었지만, `status` 는 `twin.as_of`(현재) 시점의 값이라 그보다 앞선
+    홀드아웃 `as_of` 에서는 쓸 수 없다(나중에 결제된 청구서가 `status=PAID` 로
+    보여 미결제를 놓친다). 그 시점 기준 미결제인지는 `paid_at` 으로 판정해야
+    정확하다 - `paid_at is None or paid_at > as_of`. 홀드아웃 재구성 실측
+    검증(리뷰 W3~W5, `test_holdout_issued_unpaid_reconstruction_matches_billing_status`)
+    은 이 판정이 옳음을 확인했다.
+    """
 
     billings = [b for b in twin.card_billings if b.card_id == card_id]
     if not billings:
@@ -318,6 +350,7 @@ def _build_cards(twin: TwinInput, ledger: tuple[LedgerTx, ...], as_of: date) -> 
             CardState(
                 id=card.id,
                 withdrawal_weekday=card.withdrawal_weekday,
+                withdrawal_account_id=card.withdrawal_account_id,  # S33
                 unbilled=unbilled,
                 issued_unpaid=issued_unpaid,
             )
@@ -359,7 +392,21 @@ def _fixed_expense_amount(
     matches.sort(key=lambda r: r.date, reverse=True)
     recent = matches[:3]
     if not recent:
-        return 0, [FdtWarning(code=W_FIXED_VARIABLE_UNKNOWN, details={"fixed_expense_id": fx.id})]
+        # N20: SPEC R6 의 facts `unknown_variable_fixed` 를 만들려면 이름·유형·
+        # 계좌·카드까지 필요하다. `fixed_expense_id` 만으로는 W8/facts 단계가
+        # twin 을 다시 뒤져야 한다.
+        return 0, [
+            FdtWarning(
+                code=W_FIXED_VARIABLE_UNKNOWN,
+                details={
+                    "fixed_expense_id": fx.id,
+                    "name": fx.name,
+                    "expense_type": fx.expense_type.value,
+                    "withdrawal_account_id": fx.withdrawal_account_id,
+                    "card_id": fx.card_id,
+                },
+            )
+        ]
 
     amounts = [abs(r.signed_amount) for r in recent]
     return round(statistics.median(amounts)), []
@@ -406,6 +453,7 @@ def _fixed_expense_queue_items(
                     certainty=certainty,
                     account_id=fx.withdrawal_account_id,
                     card_id=fx.card_id,
+                    source_fixed_expense_id=fx.id,
                 )
             )
     return _QueueBuildResult(items, warnings)
@@ -428,6 +476,7 @@ def _loan_queue_items(
                     certainty=1.0,
                     account_id=loan.withdrawal_account_id,
                     card_id=None,
+                    source_loan_id=loan.id,
                 )
             )
     return items
@@ -457,12 +506,17 @@ def _card_queue_items(
                     certainty=0.9,
                     account_id=card.withdrawal_account_id,
                     card_id=card.id,
+                    source_card_id=card.id,
                 )
             )
 
         for billing in card_state.issued_unpaid:
             due = _first_weekday_on_or_after(billing.billing_date, card.withdrawal_weekday)
             if due <= as_of:
+                # S40: 예정 출금일이 이미 지났으면(연체) as_of+1 로 당긴다. §7.2
+                # 4단계는 카드 출금을 매일 재시도하므로, 다음 영업일(as_of+1)에
+                # 다시 시도하는 것으로 표현하는 편이 "다음 withdrawal_weekday"
+                # 까지 그대로 기다리는 것보다 그 재시도 규칙과 정합한다.
                 due = as_of + timedelta(days=1)
             items.append(
                 Committed(
@@ -473,22 +527,68 @@ def _card_queue_items(
                     certainty=1.0,
                     account_id=card.withdrawal_account_id,
                     card_id=card.id,
+                    source_card_id=card.id,
                 )
             )
     return items
 
 
+def _known_recurring_names(
+    twin: TwinInput,
+) -> tuple[dict[int, set[str]], dict[int, set[str]]]:
+    """B3/S30/S31: 원장 탐지 반복 고정비가 만들지 말아야 할 (계좌 또는 카드,
+    이름) 집합. `fixed_expenses`(대출이자는 loans[] 에서 별도로 큐에 들어가고,
+    카드대금은 cards[] 에서 별도로 들어간다)와 같은 이름·같은 계좌/카드로
+    원장에 `FIXED` 레코드가 남아 있으면, 그 이름을 원장 탐지가 다시 잡아
+    `LOAN 대출이자` + `SUBSCRIPTION/DETECTED_FIXED 대출이자` 처럼 이중 계상하게
+    된다(리뷰 B3 실측: B 프로필 대출이자 68,000원이 매달 두 번 잡힘).
+
+    `fixed_expenses` 는 `active` 여부와 무관하게 전부 포함한다 - 비활성화되거나
+    개명된 뒤에도 활성 시절의 `FIXED` 레코드가 원장에 남아 있어, `active` 로
+    걸러내면 정확히 그 시점에 유령 항목이 생긴다.
+    """
+
+    by_account: dict[int, set[str]] = {}
+    by_card: dict[int, set[str]] = {}
+
+    def _add_account(account_id: int | None, name: str) -> None:
+        if account_id is not None:
+            by_account.setdefault(account_id, set()).add(name)
+
+    def _add_card(card_id: int | None, name: str) -> None:
+        if card_id is not None:
+            by_card.setdefault(card_id, set()).add(name)
+
+    for fx in twin.fixed_expenses:
+        _add_account(fx.withdrawal_account_id, fx.name)
+        _add_card(fx.card_id, fx.name)
+    for loan in twin.loans:
+        _add_account(loan.withdrawal_account_id, "대출이자")
+    for card in twin.cards:
+        card_bill_name = f"{_CARD_BILL_KEYWORD} {card.card_name}"
+        _add_account(card.withdrawal_account_id, card_bill_name)
+        _add_card(card.id, card_bill_name)
+
+    return by_account, by_card
+
+
 def _detected_fixed_queue_items(
     twin: TwinInput, ledger_upto: tuple[LedgerTx, ...], as_of: date, horizon_cap: int
 ) -> list[Committed]:
-    active_fixed_names = {fx.name for fx in twin.fixed_expenses if fx.active}
+    excluded_by_account, excluded_by_card = _known_recurring_names(twin)
 
     groups: dict[tuple[int | None, int | None, str], list[LedgerTx]] = {}
     for record in ledger_upto:
         if record.flow != Flow.FIXED:
             continue
         name = record.merchant_name_raw
-        if name is None or name in active_fixed_names:
+        if name is None:
+            continue
+        if record.account_id is not None and name in excluded_by_account.get(
+            record.account_id, ()
+        ):
+            continue
+        if record.card_id is not None and name in excluded_by_card.get(record.card_id, ()):
             continue
         key = (record.account_id, record.card_id, name)
         groups.setdefault(key, []).append(record)
@@ -804,11 +904,22 @@ def build_state_with_warnings(
     budgets_override: dict[int, int] | None = None,
     income: IncomeSchedule | None = None,
     horizon_cap: int = _DEFAULT_HORIZON_CAP,
+    account_balances: dict[int, int] | None = None,
 ) -> tuple[State, list[FdtWarning]]:
+    """State(t) 를 만든다 (SPEC 5장).
+
+    `account_balances` (리뷰 B1 대응, H1 계약): 주어지면 그 계좌들의 잔액은
+    `ledger_mod.account_balance_at` 로 다시 계산하지 않고 그대로 신뢰한다.
+    `build_engine` 이 `as_of` 로 원장을 잘라내면(홀드아웃) `account_balance_at`
+    의 `opening_balance is None` 역산 분기가 잘려나간 구간을 보지 못해 항상
+    0을 빼는 문제가 있으므로, 호출자가 원장을 자르기 전에 계산한 잔액을 여기로
+    주입해 우회한다. `None`(기본값)이면 기존 동작(원장에서 직접 계산)과 같다.
+    """
+
     effective_as_of = as_of if as_of is not None else twin.as_of
 
     accounts, liquidity, emergency_fund = _build_accounts_and_balances(
-        twin, ledger, effective_as_of
+        twin, ledger, effective_as_of, account_balances
     )
     cards = _build_cards(twin, ledger, effective_as_of)
     queue_result = _build_committed_queue_with_warnings(
@@ -841,6 +952,7 @@ def build_state(
     budgets_override: dict[int, int] | None = None,
     income: IncomeSchedule | None = None,
     horizon_cap: int = _DEFAULT_HORIZON_CAP,
+    account_balances: dict[int, int] | None = None,
 ) -> State:
     state, _warnings = build_state_with_warnings(
         twin,
@@ -849,5 +961,6 @@ def build_state(
         budgets_override=budgets_override,
         income=income,
         horizon_cap=horizon_cap,
+        account_balances=account_balances,
     )
     return state

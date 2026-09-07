@@ -1,6 +1,6 @@
-# FDT 엔진 명세 (SPEC) v0.3
+# FDT 엔진 명세 (SPEC) v0.4
 
-- 상태: v0.3 (2026-09-07, W1/W2 리뷰 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
+- 상태: v0.4 (2026-09-07, W3/W4/W5 리뷰 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
 - 범위: **엔진만**. 자연어 라우팅(에이전트), 코칭 문장 생성, 대시보드, 이체 실행은 전부 범위 밖이다.
 - 상위 문서: `../../00_특화PJT_기획/07_FINAL/01_KeyFin_기획의도.md`, `02_KeyFin_요구사항명세.md`, `FDT.md`, ERD `ERD_v1.1`(erdcloud RvbfSXjYXdjM8RdjK), 금융망 API 문서 `docs/금융_api/`.
 - 선행 구현: `../03_Finance-Digital-Twin` 의 트윈 코어 공식(설계서 §7)을 계승한다. 계승·변경 내역은 §13에 적는다.
@@ -118,7 +118,8 @@ TwinInput(JSON) ──build_engine()──▶ Engine ──run(ModeRequest)─�
   }],
   "loans": [{                                         // 선택. 금융망 대출 API 대응
     "id": 50, "balance": 12000000, "annual_rate_pct": 6.8, "interest_day": 15,
-    "withdrawal_account_id": 10, "repayment": "INTEREST_ONLY"   // INTEREST_ONLY | AMORTIZING(원리금균등)
+    "withdrawal_account_id": 10, "repayment": "INTEREST_ONLY",  // INTEREST_ONLY | AMORTIZING(원리금균등)
+    "term_months?": 36                                 // 선택. 잔여 상환 개월. 없으면 36개월 가정(§5.4)
   }],
   "budgets": [{                                       // budgets + budget_envelopes (선택. 없으면 엔진이 제안)
     "budget_month": "202609", "status": "CONFIRMED",   // status 값 집합: PROPOSED | CONFIRMED
@@ -157,6 +158,10 @@ TwinInput(JSON) ──build_engine()──▶ Engine ──run(ModeRequest)─�
 | 관리 대상(`is_managed`) 계좌 0개 | 오류 `E-INPUT-EMPTY` |
 | 거래 이력 < 28일 | 경고 `W-INPUT-SHORT_HISTORY`, Behavior 는 기본값 비중 증가 |
 
+`as_of` 를 `twin.as_of` 보다 앞으로 당겨 빌드한 경우(홀드아웃) 대사·잔액 역산은 그 `as_of` 를 기준으로 한다. 즉 `opening_balance + Σ부호거래(≤ as_of) ≠ balance_at(as_of)` 로 대사하고, `opening_balance is None` 이면 `balance(twin.as_of) − Σ부호거래(as_of < date ≤ twin.as_of)` 로 역산한다(§4.1 구현 규칙 참조).
+
+모든 입력 검증 실패(`E-INPUT-*` 포함)는 `FdtError(code)` 로 던진다. pydantic `ValidationError` 는 메시지를 파싱하지 않고 `extract_errors` 로 구조화해 `FdtError` 로 감싼다. 여러 오류가 동시에 발생하면 전부 보고한다(`error.details.errors[]`, §9.1).
+
 ---
 
 ## 4. 엔진 객체 `Engine`
@@ -166,7 +171,7 @@ TwinInput(JSON) ──build_engine()──▶ Engine ──run(ModeRequest)─�
 ```
 Engine
 ├ meta        : engine_id(입력 해시 12자), built_at, as_of, schema_version, warnings[]
-├ ledger      : LedgerTx[]  (정규화·분류된 불변 원장)
+├ ledger      : LedgerTx[]  (정규화·분류된 불변 원장. 전체 기간, as_of 로 자르지 않는다)
 ├ state       : State(t)             §5
 ├ behavior    : Behavior             §6
 ├ externals   : Externals            §3.2
@@ -174,9 +179,11 @@ Engine
 ```
 
 - `build_engine(twin_input, *, budgets_override=None, strict=False) -> Engine`
-- `Engine.save(path)` : ledger·state·behavior·externals·meta 를 JSON 으로. `Engine.load(path)` 는 재계산 없이 복원. `engine_id` 가 다르면 로드 거부.
-- `Engine.fork()` : What-if 용 얕은 복제. 원장은 공유(불변), state 만 복사.
+- **구현 규칙(S34):** `build_engine` 은 전체 원장으로 대사·잔액 역산을 한 뒤 `as_of` 이하로 절단한 원장만 엔진에 보관한다. 즉 `account_balance_at`/`reconcile` 은 절단 전 전체 원장에 대해 그 `as_of` 기준으로 수행하고, `Engine.ledger` 에는 절단된 결과만 남긴다(§3.3 대사 규칙 참조). 이렇게 해야 과거 `as_of` 로 빌드해도 미래 거래가 잔액에 누수되지 않고, `reconcile` 이 그 `as_of` 잔액과 맞아 오탐 경고가 나지 않는다.
+- `Engine.to_dict()` / `Engine.from_dict()` : ledger·state·behavior·externals·meta 를 dict(직렬화 가능 구조)로 왕복한다. 파일 I/O 는 하지 않는다(§4.2-7). 파일 저장·복원은 `fdt/tools/engine_io.py` 의 `save_engine(engine, path)` / `load_engine(path) -> Engine` 이 맡는다(내부에서 `to_dict`/`from_dict` 를 호출). `engine_id` 가 다르면 `load_engine` 이 로드를 거부한다(`E-ENGINE-ID-MISMATCH`).
+- `Engine.fork()` : What-if 용 얕은 복제. 원장은 공유(불변), state 만 복사. `meta` 도 복사한다(분기가 경고를 추가해도 원본을 오염시키지 않는다).
 - 엔진은 **as_of 를 바꾸지 않는다**. 다른 기준일은 새 엔진이다(홀드아웃 누수 방지).
+- **`EngineBuildMeta`(엔진 내부, dataclass) vs `EngineMeta`(§9.1 출력, pydantic) 구분.** `EngineBuildMeta` 는 빌드 시점 불변 메타(`engine_id`, `as_of`, `engine_version`, `warnings`, `budgets_override` 등, 재현성을 위해 `built_at` 은 담지 않는다)이고 엔진 내부 전용이다. `Engine.run()` 이 매 호출마다 요청의 `mode`/`seed`/`n_paths`/`horizon_days`/`elapsed_ms` 를 채워 `schemas.result.EngineMeta` 로 옮기며, §9.1 `meta` 로 나가는 것은 오직 `EngineMeta` 뿐이다. `EngineMeta.warnings` 는 `ResultWarning{code, message, details}` 의 배열이다(§9.1).
 
 ### 4.2 불변 원칙 (MUST)
 
@@ -202,12 +209,14 @@ Engine
   "liquidity": 1830000,            // PRIMARY 잔액
   "emergency_fund": 350000,        // EMERGENCY 합. 시뮬레이션이 자동 사용하지 않는다
   "cards": [{
-    "id":20, "withdrawal_weekday":1, "unbilled":92300,        // 이번 청구 주기 누적(승인−취소)
+    "id":20, "withdrawal_weekday":1, "withdrawal_account_id":10, "unbilled":92300,   // 이번 청구 주기 누적(승인−취소)
     "issued_unpaid":[{"billing_date":"2026-09-01","amount":183500}]
   }],
   "committed": [{                  // 약정 큐, as_of+1 ~ as_of+horizon_cap(90)
-    "kind":"RENT","name":"월세","due":"2026-09-25","amount":700000,"certainty":1.0,"account_id":10,"card_id":null
-    // kind 허용 집합: RENT | UTILITY | INSURANCE | TELECOM | SUBSCRIPTION | LOAN | CARD_BILL | SELF_TRANSFER
+    "kind":"RENT","name":"월세","due":"2026-09-25","amount":700000,"certainty":1.0,"account_id":10,"card_id":null,
+    "source_fixed_expense_id":40,"source_loan_id":null,"source_card_id":null
+    // kind 허용 집합: RENT | UTILITY | INSURANCE | TELECOM | SUBSCRIPTION | LOAN | CARD_BILL | SELF_TRANSFER | DETECTED_FIXED
+    // DETECTED_FIXED = 원장 탐지 일반 고정비(§5.4). source_fixed_expense_id/source_loan_id/source_card_id 는 선택(?), 근거가 없으면 null
     // 수입은 큐에 넣지 않는다(§8.2 events 로만 표현)
   }],
   "envelopes": [{
@@ -241,7 +250,7 @@ Engine
 | EMERGENCY | PRIMARY 외 관리 계좌 합 |
 | 잔액 | 입력 `balance` 를 as_of 잔액으로 신뢰. `opening_balance` 가 있으면 대사 검사(§3.3) |
 | `unbilled` | 이번 청구 주기(직전 월요일 ~ as_of, as_of 가 월요일이면 당일부터) 카드 `SPEND+FIXED−REFUND` 순액 |
-| `issued_unpaid` | `card_billings[status=UNPAID, billing_date ≤ as_of]`. 없고 직전 주 승인이 원장에 `CARD_BILL` 로 안 보이면 재구성 |
+| `issued_unpaid` | `card_billings[billing_date ≤ as_of, paid_at is null 또는 paid_at > as_of]`(`paid_at` 기준. `status` 는 `twin.as_of` 시점 값이라 홀드아웃 `as_of` 판정에 쓰지 않는다). 없고 직전 주 승인이 원장에 `CARD_BILL` 로 안 보이면 재구성 |
 | 약정 큐 | §5.4 |
 | 봉투 예산 | `budgets[budget_month == as_of 월]` 의 `confirmed_amount` → 없으면 `proposed_amount` → 없으면 엔진 제안(§5.5) |
 | `spent` | 이번 달 1일 ~ as_of 봉투 순지출 |
@@ -254,13 +263,17 @@ Engine
 | 종류 | 근거 | 다음 예정일 | 금액 | certainty |
 | --- | --- | --- | --- | --- |
 | RENT/UTILITY/INSURANCE/TELECOM/SUBSCRIPTION | `fixed_expenses[active]` | `payment_day` 의 다음 발생일(말일 보정), 매월 반복 | `amount`. `is_variable` 이면 원장 최근 3회 중앙값, 없으면 0 + 경고 | 1.0 (변동형 0.8) |
-| LOAN 이자 | `loans[]` | `interest_day` | `balance × (rate+delta_bp/100)/100/12`, 10원 단위. AMORTIZING 이면 원리금균등 월납 | 1.0 |
+| LOAN 이자 | `loans[]` | `interest_day` | `balance × (rate+delta_bp/100)/100/12`, 10원 단위. `AMORTIZING` 은 `term_months` 로 원리금균등, `term_months` 가 없으면 36개월 가정 | 1.0 |
 | 카드대금(미청구) | `cards.unbilled` | 다음 월요일 발행 후 첫 `withdrawal_weekday` | `unbilled` | 0.9 |
-| 카드대금(미결제) | `issued_unpaid` | 다음 `withdrawal_weekday`(as_of 포함) | 청구액 | 1.0 |
-| 원장 탐지 반복 고정비 | `FIXED` 거래를 (계좌/카드, 이름) 로 묶어 월 1회(간격 25~35일) 2회 이상 반복 | 마지막 발생 + 1개월 | 최근 3회 중앙값 | 0.9 |
+| 카드대금(미결제) | `issued_unpaid` | 다음 `withdrawal_weekday`(as_of 포함). 단 예정 출금일이 `as_of` 이하이면(연체) `due = as_of + 1` 로 둔다(§7.2 4단계의 매일 재시도와 정합) | 1.0 |
+| 원장 탐지 반복 고정비 | `FIXED` 거래를 (계좌/카드, 이름) 로 묶어 월 1회(간격 25~35일) 2회 이상 반복. `kind = DETECTED_FIXED` 로 표기(§5.1) | 마지막 발생 + 1개월 | 최근 3회 중앙값 | 0.9 |
 | 원장 탐지 반복 자기이체 | `TRANSFER_INTERNAL` 거래를 (출금 계좌, 상대 계좌, 금액 ±10%) 로 묶어 월 1회(간격 25~35일) 2회 이상 반복 | 마지막 발생 + 1개월 | 최근 3회 중앙값 | 0.9 |
 
-중복 제거: `fixed_expenses` 와 원장 탐지가 같은 이름이면 `fixed_expenses` 우선. 동일 (kind, name, due) 는 하나.
+`AMORTIZING` 을 실측 검증하려면 §11 프로필 중 하나(B 변형)에 `term_months` 지정 프로필을 추가해야 한다. 이는 v0.2 과제로 남긴다(SPEC 은 규칙만 정의).
+
+중복 제거: 동일 (kind, name, due, amount) 는 하나. `fixed_expenses`·`loans[]`·`cards[]` 에서 이미 만든 항목과 같은 (계좌 또는 카드, 이름) 을 갖는 원장 탐지 항목(`DETECTED_FIXED`)은 만들지 않는다(대출이자·카드대금 이중 계상 방지). 단 이 키로도 (b) 의미적 중복(예: 이름이 바뀐 고정비)까지는 못 잡을 수 있다.
+
+`state.committed` 는 `as_of+1 ~ as_of+90` 구간만 담는다(§7.1 참조. `horizon_days > 90` 요청은 모드 러너가 큐를 재생성한다).
 
 ### 5.5 엔진 예산 제안 `propose_budgets`
 
@@ -274,15 +287,21 @@ Engine
 
 | 파라미터 | 추정 | 클립·기본값 |
 | --- | --- | --- |
-| `daily_rate[e]` | 봉투 e 건수 / 윈도우 일수 | |
+| `daily_rate[e]` | 봉투 e 건수(돌발로 분류된 건 제외, 아래 2-pass 참조) / 윈도우 일수 | |
 | `weekday_mult[e][w]` | `(c_w + 2) / (E_w + 2)` 후 평균 1 정규화 | `n_e < 10` 이면 전부 1.0 |
-| `amount_mu[e], amount_sigma[e]` | 로그정규 MLE | sigma [0.2, 1.5]. `n_e < 5` 면 전 봉투 통합, 통합도 5 미만이면 `mu=ln 10000, sigma=0.6` |
+| `amount_mu[e], amount_sigma[e]` | 돌발로 분류된 건을 제외한 표본의 로그정규 MLE(2-pass) | sigma [0.2, 1.5]. `n_e < 5` 면 전 봉투 통합, 통합도 5 미만이면 `mu=ln 10000, sigma=0.6`. 이력 < 28일이면 이 통합(pooled) 기준으로 `n_e < 10` 을 적용한다 |
 | `card_share[e]` | 카드 건수 / 건수 | `n_e=0` 이면 전체 비율, 그것도 0이면 0.5 |
-| `payday_boost` | 수입 후 7일 일평균 / 그 외 일평균 | [0.7, 2.0]. 표본 14일 미만이면 1.0 |
-| `pre_payday_damp` | 다음 수입 5일 전 일평균 / 그 외 일평균 | [0.5, 1.3]. 표본 10일 미만이면 1.0 |
-| `elasticity[e]` | 봉투 잔여율 < 0.2 인 날 일평균 / 그 외 | [0.5, 2.0]. 저잔여일 5일 미만이면 1.0. 유연 봉투(외식·쇼핑·취미·여가·기타) 는 대표값 부근, 필수 봉투(교통비·의료·건강·편의점·마트·잡화) 는 1.0 근처 |
-| `shock_daily_prob, shock_mu, shock_sigma` | `금액 ≥ max(50,000, 5·exp(mu_e))` 건 | 0건이면 `0.01, ln 100000, 0.6` |
-| 수입 일정 (§6.6) | INCOME 거래 일자 간격 cv ≤ 0.25 이고 day-of-month 최빈 비율 ≥ 0.6 → 규칙적. 그 외 불규칙 | 1건 이하면 `next=None, expected=0` |
+| `payday_boost` | 창 `[수입일, 수입일+6]` 일평균 / 그 외 일평균 | [0.7, 2.0]. 표본 14일 미만이면 1.0 |
+| `pre_payday_damp` | 창 `[다음 수입일−5, 다음 수입일−1]` 일평균 / 그 외 일평균 | [0.5, 1.3]. 표본 10일 미만이면 1.0 |
+| `elasticity[e]` | 봉투 잔여율 < 0.2 인 날 일평균 / 그 외 | 필수 봉투(교통비·의료·건강·편의점·마트·잡화) 클립 [0.8, 1.2], 유연 봉투(외식·쇼핑·취미·여가·기타) 클립 [0.5, 2.0]. **저잔여일 < 10일이면 1.0**(기존 5일 기준을 상향) |
+| `shock_daily_prob, shock_mu, shock_sigma` | `금액 ≥ max(50,000, 5·exp(mu_e))` 건 | 0건이면 `0.01, ln 100000, 0.6`. `shock_sigma` 하한 0.3(절단분포로 인한 과소추정 방지, 원시값이 이보다 작으면 0.3 으로 올림) |
+| 수입 일정 (§6.6) | INCOME 거래 일자 간격 cv ≤ 0.25 이고 day-of-month 최빈 비율 ≥ 0.6 → 규칙적. 그 외 불규칙. 최빈값이 동률이면 **작은 날짜** 를 고른다 | 1건 이하면 `next=None, expected=0` |
+
+`payday_boost`/`pre_payday_damp` 겹침 규칙: 수입 간격 중앙값이 12일 미만이거나 불규칙이면 두 창이 겹칠 수 있다. 이 경우 **`pre_payday_damp` 는 1.0 으로 고정**하고, `payday_boost` 는 급여 전 창(`[다음 수입일−5, 다음 수입일−1]`)을 표본에서 제외하고 추정한다(추정기 규칙. §7.2 의 생성기는 이 규칙과 무관하게 두 계수를 곱하는 쪽이 정본이다). §11 C 프로필처럼 수입 간격이 10~11일인 사용자는 이 규칙이 적용되어 두 파라미터의 신뢰구간이 넓다는 점을 감안한다.
+
+봉투 금액(`amount_mu`/`amount_sigma`)과 `daily_rate` 추정은 2-pass 로 한다. 1차로 `shock_daily_prob/mu/sigma` 판정 기준(금액 ≥ 임계)에 걸리는 건을 돌발로 분류하고, 2차로 그 건을 제외한 표본만으로 `daily_rate`/`amount_mu`/`amount_sigma` 를 다시 추정한다. 이렇게 하지 않으면 `기타` 봉투처럼 돌발이 몰리는 봉투의 일상 소비 분포가 돌발에 오염된다.
+
+각주(N13): 잔액 부족 시 거절된 체크 소비는 원장에 남지 않는다(§11). 이 때문에 잔액이 얇은 사용자일수록 `daily_rate` 는 과소, `card_share` 는 과대 추정되는 구조적 편향이 있다. 시뮬레이터가 `suppressed_demand` 를 별도로 누적할 경우, 이 편향과 `suppressed_demand` 를 함께 반영하면 억제 효과를 이중으로 세게 된다. 두 메커니즘이 같은 현상(거절)을 서로 다른 경로로 반영하고 있음을 W6/W7 이 인지해야 한다.
 
 Behavior 는 **원장만** 읽는다. 생성기의 프로필 YAML·`ground_truth` 를 읽으면 반려(순환 검증 금지).
 
@@ -300,6 +319,7 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
 - `injections`: What-if 가상 이벤트 목록(§8.2 표).
 - `overrides`: 시뮬 기간 동안만 적용하는 상태 변경(예산 변경, 고정비 중단, 외부 변수 변경). 원본 `state` 는 건드리지 않는다.
 - 결과 배열 shape `(n_paths, horizon_days+1)`. `dates[0] = as_of`(기록값은 as_of 잔액).
+- `state.committed` 는 `as_of+90` 까지만 채워져 있다(§5.4). `horizon_days > 90` 인 요청은 모드 러너가 `build_committed_queue(horizon_cap=horizon_days+7)` 로 큐를 재생성해 시뮬레이터에 넘긴다. `simulate` 자신은 큐를 다시 만들지 않는다.
 
 ### 7.2 하루 처리 순서 (MUST, 생성기와 동일)
 
@@ -314,7 +334,8 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
             cards[] 의 카드는 kind(CREDIT|DEBIT) 와 무관하게 전부 이 주 단위 청구 주기를 따른다(금융망 카드 모델).
             체크카드(kind=DEBIT) 의 즉시 출금 소비는 이 단계가 아니라 tx_type=WITHDRAW 계좌 거래로 표현한다. kind 는 표시용이며 처리 로직을 분기하지 않는다.
 5 소비      봉투별 λ = daily_rate × weekday_mult[wd] × boost(d) × elasticity_gate × 1(price_index 는 금액에)
-            boost(d) = payday_boost^[수입 후 7일] × pre_payday_damp^[다음 수입 5일 전]
+            boost(d) = payday_boost^[수입일 ≤ d ≤ 수입일+6] × pre_payday_damp^[다음 수입일−5 ≤ d ≤ 다음 수입일−1]
+            (두 창 자체가 겹칠 수 있는 날짜는 생성기가 두 계수를 곱해서 그대로 반영한다. 이것이 정본이며, §6 의 추정기 겹침 규칙과는 별개다)
             n ~ Poisson(λ); 금액 ~ LogNormal(mu, sigma) × price_index_mult, 100원 반올림
             card_share 만큼 unbilled 로, 나머지는 cash ≥ amount 일 때 즉시 차감, 부족하면 suppressed_demand 누적
             envelope_spend[p,e] += Σ. 달이 바뀌면 spent 리셋
@@ -360,7 +381,7 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 ```
 
 - 모드 선택은 **요청자가 명시**한다. 엔진은 추론하지 않는다. 테스트 시 CLI `--mode` 로 지정한다(§10).
-- 필수 파라미터 누락은 `E-REQ-MISSING`, 범위 밖은 `E-REQ-RANGE`. 0 이나 기본값으로 조용히 바꾸지 않는다. 검증 실패 시 코드 문자열을 포함한 오류를 낸다(파싱 규약은 §9.1 참조).
+- 필수 파라미터 누락은 `E-REQ-MISSING`, 범위 밖은 `E-REQ-RANGE`. 0 이나 기본값으로 조용히 바꾸지 않는다. 검증 실패는 `FdtError(code)` 로 던지며 메시지에 코드 문자열을 파싱 대상으로 포함하지 않는다(파싱 규약은 §9.1 참조). 여러 파라미터가 동시에 실패하면 오류 코드를 전부 보고한다(`error.details.errors[]`).
 - 금액 파라미터는 0 ~ 1,000,000,000,000 정수 원.
 
 ### 8.2 FORECAST (미래 상태 예측)
@@ -511,16 +532,19 @@ AppliedAction = { injection: Injection, cut_ratio?: float, label?: str }
 {
   "schema_version": "engine-result/1",
   "meta": {"engine_id":"a3f9c1d2e4b5","as_of":"2026-09-07","mode":"RISK","seed":42,"n_paths":1000,
-           "horizon_days":30,"elapsed_ms":812,"engine_version":"0.1.0","warnings":[]},
+           "horizon_days":30,"elapsed_ms":812,"engine_version":"0.1.0",
+           "warnings":[{"code":"W-RECON","message":"...","details":{"account_id":10,"diff":144600}}]},
   "request": { ModeRequest 원문 },
   "result": { §8 모드별 },
   "facts":  [ §9.2 ],
   "viz":    [ §9.3 ],
-  "status": "OK"                          // OK | ERROR. ERROR 면 result 없음, error{code,message}
+  "status": "OK"                          // OK | ERROR. ERROR 면 result 없음, error{code,message,details}
 }
 ```
 
-`EngineError.code` 는 pydantic `ValidationError` 메시지를 파싱해서 채우지 않는다. 검증 지점에서 `FdtError(code=...)` 로 감싸 전달한 값을 그대로 옮긴다. pydantic 오류 메시지에는 코드 문자열이 포함되지만 메시지가 그 코드로 **시작함을 보장하지 않으므로**(필드명·위치가 앞에 붙는다) `startswith` 등으로 코드를 추출해서는 안 된다.
+`meta.warnings` 는 `ResultWarning{code, message, details}` 의 배열이다. `code` 는 `W-*` 코드 문자열, `message` 는 사람이 읽는 설명, `details` 는 코드별 구조화 필드(자유 dict 가 아니라 각 `W-*` 코드가 정의한 키 집합)를 담는다.
+
+`EngineError.code` 는 pydantic `ValidationError` 메시지를 파싱해서 채우지 않는다. 검증 지점에서 `FdtError(code=...)` 로 감싸 전달한 값을 그대로 옮긴다. pydantic 오류 메시지에는 코드 문자열이 포함되지만 메시지가 그 코드로 **시작함을 보장하지 않으므로**(필드명·위치가 앞에 붙는다) `startswith` 등으로 코드를 추출해서는 안 된다. 모든 검증 실패는 `FdtError(code)` 로 던지고, pydantic `ValidationError` 는 `extract_errors` 로 구조화한다(메시지 파싱 금지). 여러 파라미터·필드가 동시에 실패하면 전부 보고한다: `error.details.errors[]` 에 개별 실패를 나열한다(§8.1 참조).
 
 ### 9.2 facts (발화용 사실)
 
@@ -649,6 +673,7 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | R6 | `is_variable` 고정비 금액 추정 실패 | 원장 중앙값 없으면 0 + 경고. facts 에 `unknown_variable_fixed` 노출 |
 | R7 | facts 와 viz 라벨 불일치 | `fdt validate` 가 annotations·caption 의 숫자를 facts 집합과 대조 |
 | R8 | 생성기·시뮬레이터 규칙 발산 | §7.2 를 정본으로 삼는다. 두 코드가 공유 상수 모듈을 쓰게 하고, §15.A 표를 두 코드 공통 테스트로 고정한다 |
+| R9 | C 프로필처럼 수입 간격이 짧은 사용자는 `payday_boost`/`pre_payday_damp` 신뢰구간이 넓다 | §6 겹침 규칙(수입 간격 < 12일 또는 불규칙 → `pre_payday_damp=1.0` 고정, `payday_boost` 는 급여 전 창 제외)으로 완화. 근본 해결은 v0.2 표본 확대·구간 추정 |
 | M1 | 확률 표기를 % 정수로 할지 소수로 할지 | 모드 내 통일만 강제. 에이전트 팀과 합의 후 고정 |
 | M2 | GOAL `SAVE` 타입의 "저축" 정의(비상금 이체 포함 여부) | v0.1: PRIMARY 잔액 증가분으로 정의 |
 
@@ -732,3 +757,27 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | S25 | §5.2 `LedgerTx` 정의에 "`tx_type == CARD` 인 거래의 `account_id` 는 `None`" 명시. §3.2 `cards` 주석과 §7.2 4단계에 "`cards[]` 의 카드는 `kind` 와 무관하게 전부 주 단위 청구 주기를 따른다(금융망 카드 모델). 체크카드 즉시 출금 소비는 `tx_type=WITHDRAW` 계좌 거래로 표현한다. `kind` 는 표시용" 명시 |
 | S26 | §11 `ground_truth.json` 필드 목록에 `declined_debits[].kind`, `unpaid_obligation`, `suppressed_demand` 추가 |
 | S27 | §11 프로필 표 B 행에 "급여 25일 287만" 명시 |
+
+`docs/reviews/20260907_W3_W4_W5.md` W3·W4·W5 리뷰의 "SPEC 수정 제안" 반영 내역 (v0.3 → v0.4).
+
+| # | 요약 |
+| --- | --- |
+| S28 | §5.3 `issued_unpaid` 정의를 `card_billings[status=UNPAID, billing_date ≤ as_of]` 에서 `card_billings[billing_date ≤ as_of, paid_at is null 또는 paid_at > as_of]` 로 수정. 홀드아웃 `as_of` 판정은 `status`(twin.as_of 시점 값)가 아니라 `paid_at` 기준이어야 함을 명시 |
+| S29 | §3.2 `loans[]` 에 `term_months?`(잔여 상환 개월) 추가. §5.4 LOAN 행에 "`AMORTIZING` 은 `term_months` 로 원리금균등, 없으면 36개월 가정" 명시. `AMORTIZING` 실측 검증을 위한 §11 B 변형 프로필 지정은 v0.2 과제로 메모만 남긴다 |
+| S30 | §5.4 중복 제거 문장을 "동일 (kind, name, due, amount) 는 하나" 로 수정하고, "`fixed_expenses`·`loans[]`·`cards[]` 에서 이미 만든 항목과 같은 (계좌 또는 카드, 이름) 을 갖는 원장 탐지 항목은 만들지 않는다" 추가(대출이자 이중 계상 방지) |
+| S31 | §5.1 `Committed.kind` 허용 집합에 `DETECTED_FIXED`(원장 탐지 일반 고정비) 추가. §5.4 원장 탐지 반복 고정비 행에 이 kind 로 표기함을 명시 |
+| S32 | §5.1 `Committed` 에 `source_fixed_expense_id?`/`source_loan_id?`/`source_card_id?` 추가 |
+| S33 | §5.1 `CardState` 에 `withdrawal_account_id` 추가 |
+| S34 | §3.3/§4.1 에 "`as_of` 를 `twin.as_of` 보다 앞으로 당겨 빌드한 경우 대사·잔액 역산은 그 `as_of` 를 기준으로 한다" 추가. 구현 규칙으로 "`build_engine` 은 전체 원장으로 대사·잔액 역산을 한 뒤 `as_of` 이하로 절단한 원장만 엔진에 보관한다" 명시(홀드아웃 미래 누수·`W-RECON` 오탐 방지) |
+| S35 | §6/§7.2 `payday_boost` 창을 `[수입일, 수입일+6]`, `pre_payday_damp` 창을 `[다음 수입일−5, 다음 수입일−1]` 로 명문화. 두 창이 겹치는 경우(수입 간격 중앙값 < 12일 또는 불규칙) 추정기 규칙을 "`pre_payday_damp` 는 1.0 고정, `payday_boost` 는 급여 전 창을 제외해 추정" 으로 정하고, 생성기는 두 계수를 곱하는 쪽을 정본으로 삼는다(§7.2). §14 R9, §6 각주로 C 프로필처럼 수입 간격이 짧으면 두 파라미터 신뢰구간이 넓음을 명시 |
+| S36 | §6 `elasticity[e]` 행의 "봉투 잔여율" 을 "그 달 1일부터 전날까지의 봉투 순지출 누적 / 예산, 월 경계에서 리셋" 으로 명문화(생성기 `_elasticity_gate` 와 동일 정의) |
+| S37 | §6 수입 일정의 day-of-month 최빈값 동률 시 "작은 날짜" 를 고른다 추가 |
+| S38 | §6 돌발 모델 행에 `shock_sigma` 하한 0.3 명시 |
+| S39 | §3.3/§9.1 에 "모든 검증 실패는 `FdtError(code)` 로 던지고 pydantic `ValidationError` 는 `extract_errors` 로 구조화한다(메시지 파싱 금지). 여러 오류는 전부 보고한다(`error.details.errors[]`)" 명시. §8.1 에도 동일 취지 추가 |
+| S40 | §5.4 카드대금(미결제) 행에 "예정 출금일이 `as_of` 이하이면(연체) `due = as_of + 1` 로 둔다(§7.2 4단계의 매일 재시도와 정합)" 추가 |
+| S41 | §6 `elasticity[e]` 가드를 "저잔여일 < 10일이면 1.0" 으로 상향하고, 필수 봉투 클립 [0.8, 1.2] / 유연 봉투 클립 [0.5, 2.0] 로 분리 |
+| S42 | §5.1/§7.1 에 "`state.committed` 는 `as_of+90` 까지. `horizon_days > 90` 인 요청은 모드 러너가 `build_committed_queue(horizon_cap=horizon_days+7)` 로 큐를 재생성해 시뮬레이터에 넘긴다" 명시 |
+| S43 | §6 봉투 금액·발생률(`daily_rate`/`amount_mu`/`amount_sigma`) 추정에서 돌발로 분류된 건을 제외하는 2-pass 절차 추가. 이력 < 28일이면 통합(pooled) 기준으로 `n_e < 10` 적용 |
+| 추가1 | §9.1 `meta.warnings` 를 `ResultWarning{code, message, details}` 배열로 명시(자유 dict 지양) |
+| 추가2 | §6 각주(N13)로 거절된 체크 소비(원장 미기록)로 인한 잔액 얇은 사용자의 `daily_rate` 과소·`card_share` 과대 편향과, 시뮬레이터 `suppressed_demand` 와의 이중 계산 위험을 명시 |
+| 추가3 | §4.1 `Engine.save/load` 표기를 `fdt/tools/engine_io.save_engine`/`load_engine` 로 정정하고 `Engine.to_dict`/`from_dict` 를 명시. `EngineBuildMeta`(엔진 내부)와 `EngineMeta`(§9.1 출력) 를 구분하는 한 줄 추가 |

@@ -22,7 +22,7 @@ import numpy as np
 from fdt.engine.ledger import LedgerTx
 from fdt.engine.schemas.behavior import Behavior, EnvelopeBehavior, ShockModel
 from fdt.engine.schemas.state import IncomeSchedule
-from fdt.engine.taxonomy import ENVELOPE_IDS, ExcludeTag, Flow
+from fdt.engine.taxonomy import ENVELOPE_IDS, ESSENTIAL_ENVELOPES, ExcludeTag, Flow
 
 __all__ = ["detect_income_schedule", "estimate_behavior"]
 
@@ -40,17 +40,40 @@ _DEFAULT_SHOCK_PROB = 0.01
 _DEFAULT_SHOCK_MU = math.log(100_000)
 _DEFAULT_SHOCK_SIGMA = 0.6
 
+# SPEC v0.3 §6 (S38): 돌발 임계(max(50_000, 5*exp(mu_e)))가 일상 소비의
+# 오른쪽 꼬리를 잘라내 절단분포를 만들기 때문에, 하한 없이 원시 표준편차를
+# 그대로 쓰면 sigma≈0(사실상 결정론적 돌발)이 되어 더 나쁘다. 하한 0.3 은 SPEC
+# §6 표에 명문화된 안정화 상수다.
+_SHOCK_SIGMA_FLOOR = 0.3
+
 _MIN_AMOUNT_SAMPLE = 5
+# N21/SPEC §3.3 "이력 < 28일이면 Behavior 는 기본값 비중을 높인다": 이력이
+# 짧을 때(윈도우 실제 일수 < 28)만 봉투별 pooled 전환 기준을 5 -> 10 으로
+# 올려 소표본 잡음을 줄인다. 이력이 충분하면 기존 기준(5)을 그대로 쓴다.
+_MIN_AMOUNT_SAMPLE_SHORT_HISTORY = 10
+_SHORT_HISTORY_DAYS = 28
 _MIN_WEEKDAY_SAMPLE = 10
 _MIN_PAYDAY_BOOST_SAMPLE_DAYS = 14
 _MIN_PRE_PAYDAY_SAMPLE_DAYS = 10
-_MIN_ELASTICITY_LOW_DAYS = 5
+# N11/S41: 저잔여일 표본 가드를 5 -> 10 으로 올린다. 저잔여일이 5~10일
+# 구간일 때 한두 건의 큰 결제가 비율을 지배해 필수 봉투 탄력도가 상·하한에
+# 자주 튀는 문제(SPEC S24 의도 위반)를 완화한다.
+_MIN_ELASTICITY_LOW_DAYS = 10
+# N11/S41: 필수 봉투(교통비/의료·건강/편의점·마트·잡화)는 탄력도를 1.0
+# 근처로 더 좁게 클립하고, 유연 봉투는 기존 범위를 유지한다.
+_ESSENTIAL_ELASTICITY_BOUNDS = (0.8, 1.2)
+_FLEXIBLE_ELASTICITY_BOUNDS = (0.5, 2.0)
+# N12/S35: 급여 창 겹침(수입 간격 < 12일 또는 불규칙) 임계.
+_PAYDAY_WINDOW_OVERLAP_GAP_DAYS = 12
 
 _ENVELOPE_EXCLUDED_TAGS: frozenset[ExcludeTag] = frozenset(
     {ExcludeTag.EMERGENCY, ExcludeTag.CARRYOVER}
 )
 
 _ALL_ENVELOPE_IDS: tuple[int, ...] = tuple(sorted(ENVELOPE_IDS.values()))
+_ESSENTIAL_ENVELOPE_IDS: frozenset[int] = frozenset(
+    ENVELOPE_IDS[name] for name in ESSENTIAL_ENVELOPES
+)
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +264,17 @@ def _is_before_income(day: date, income_dates: list[date]) -> bool:
 
 
 def _payday_boost(
-    daily_spend: dict[date, int], window_start: date, as_of: date, income_dates: list[date]
+    daily_spend: dict[date, int],
+    window_start: date,
+    as_of: date,
+    income_dates: list[date],
+    *,
+    exclude_before_window: bool,
 ) -> float:
+    """SPEC §6/S35: 수입 간격이 12일 미만(또는 불규칙)이라 급여 후 창과
+    다음 급여 전 창이 겹칠 때는, "다음 수입 5일 전" 창에 속한 날을 분모·
+    분자(after_vals/other_vals) 양쪽 모두에서 제외하고 추정한다."""
+
     after_vals: list[int] = []
     other_vals: list[int] = []
     day = window_start
@@ -250,6 +282,8 @@ def _payday_boost(
         val = daily_spend.get(day, 0)
         if _is_after_income(day, income_dates):
             after_vals.append(val)
+        elif exclude_before_window and _is_before_income(day, income_dates):
+            pass
         else:
             other_vals.append(val)
         day += timedelta(days=1)
@@ -352,6 +386,8 @@ def _elasticity(
     window_start: date,
     as_of: date,
     budget: int,
+    *,
+    essential: bool,
 ) -> float:
     daily_net = _envelope_daily_net_spend(ledger, envelope_id, as_of)
     safe_budget = max(1, budget)
@@ -384,12 +420,21 @@ def _elasticity(
     if baseline <= 0:
         return 1.0
     ratio = (sum(low_values) / len(low_values)) / baseline
-    return min(2.0, max(0.5, ratio))
+    lo, hi = _ESSENTIAL_ELASTICITY_BOUNDS if essential else _FLEXIBLE_ELASTICITY_BOUNDS
+    return min(hi, max(lo, ratio))
 
 
 # ---------------------------------------------------------------------------
 # 돌발 지출 (SPEC §6 표)
 # ---------------------------------------------------------------------------
+
+
+def _shock_threshold(env_mu: float) -> float:
+    """돌발 판정 임계: max(50,000원, 5 * exp(mu_e)). N14/S43: 봉투 금액
+    추정(amount_mu/sigma)과 daily_rate 는 이 임계 이상인 돌발 건을 제외하고
+    2차 재추정한다(1차 mu 로 돌발 판정 -> 2차 재추정)."""
+
+    return max(50_000.0, 5.0 * math.exp(env_mu))
 
 
 def _shock_model(
@@ -399,7 +444,7 @@ def _shock_model(
     for record in spends:
         amount = abs(record.signed_amount)
         env_mu = amount_mu_by_env.get(record.envelope_id, _DEFAULT_AMOUNT_MU)  # type: ignore[arg-type]
-        threshold = max(50_000.0, 5.0 * math.exp(env_mu))
+        threshold = _shock_threshold(env_mu)
         if amount >= threshold:
             shocks.append(amount)
 
@@ -413,7 +458,7 @@ def _shock_model(
     mu = float(arr.mean())
     sigma = float(arr.std(ddof=0)) if len(logs) > 1 else 0.0
     daily_prob = len(shocks) / max(1, n_days)
-    return ShockModel(daily_prob=daily_prob, mu=mu, sigma=max(0.3, sigma))
+    return ShockModel(daily_prob=daily_prob, mu=mu, sigma=max(_SHOCK_SIGMA_FLOOR, sigma))
 
 
 # ---------------------------------------------------------------------------
@@ -451,33 +496,82 @@ def estimate_behavior(
         if record.envelope_id in by_env:
             by_env[record.envelope_id].append(record)
 
-    payday_boost = _payday_boost(daily_spend, window_start, as_of, income_dates)
-    pre_payday_damp = _pre_payday_damp(daily_spend, window_start, as_of, income_dates)
+    # N21/S: 이력이 짧으면(윈도우 실제 일수 < 28) 봉투별 pooled 전환 기준을
+    # 5 -> 10 으로 올린다. 이력이 충분하면 기존 기준(5)을 그대로 쓴다.
+    short_history = n_days < _SHORT_HISTORY_DAYS
+    envelope_min_amount_sample = (
+        _MIN_AMOUNT_SAMPLE_SHORT_HISTORY if short_history else _MIN_AMOUNT_SAMPLE
+    )
+
+    # N12/S35: 수입 간격이 12일 미만이거나 불규칙이면 급여 후 창과 다음
+    # 급여 전 창이 겹친다. 이 경우 pre_payday_damp 는 추정하지 않고 1.0 으로
+    # 고정하며, payday_boost 는 겹치는 "급여 전" 날을 분모·분자에서 제외한다.
+    payday_windows_overlap = (
+        income.irregular
+        or income.median_gap_days is None
+        or income.median_gap_days < _PAYDAY_WINDOW_OVERLAP_GAP_DAYS
+    )
+    payday_boost = _payday_boost(
+        daily_spend,
+        window_start,
+        as_of,
+        income_dates,
+        exclude_before_window=payday_windows_overlap,
+    )
+    pre_payday_damp = (
+        1.0
+        if payday_windows_overlap
+        else _pre_payday_damp(daily_spend, window_start, as_of, income_dates)
+    )
+
+    # N14/S43: 봉투 금액 추정(amount_mu/sigma)과 daily_rate 는 돌발로 분류된
+    # 건(금액 >= max(50_000, 5*exp(mu_e)))을 제외하고 2차로 재추정한다.
+    # 1차: 전체 표본으로 예비 mu 를 구해 돌발 임계를 정한다.
+    prelim_mu_by_env: dict[int, float] = {}
+    for envelope_id in _ALL_ENVELOPE_IDS:
+        prelim_amounts = [abs(record.signed_amount) for record in by_env[envelope_id]]
+        if len(prelim_amounts) >= envelope_min_amount_sample:
+            prelim_mu_by_env[envelope_id], _sigma = _lognormal_params(prelim_amounts)
+        else:
+            prelim_mu_by_env[envelope_id] = pooled_mu
 
     envelope_behaviors: list[EnvelopeBehavior] = []
     amount_mu_by_env: dict[int, float] = {}
     for envelope_id in _ALL_ENVELOPE_IDS:
-        env_records = by_env[envelope_id]
+        env_records_all = by_env[envelope_id]
+        n_env_all = len(env_records_all)
+        daily_rate_all = n_env_all / n_days
+
+        weekday_mult = _weekday_mult(env_records_all, window_start, as_of, daily_rate_all)
+
+        card_share = (
+            sum(1 for record in env_records_all if record.card_id is not None) / n_env_all
+            if n_env_all
+            else overall_card_share
+        )
+
+        # 2차: 1차 mu 로 정한 임계 이상인 돌발 건을 제외하고 재추정한다.
+        threshold = _shock_threshold(prelim_mu_by_env[envelope_id])
+        env_records = [
+            record for record in env_records_all if abs(record.signed_amount) < threshold
+        ]
         n_env = len(env_records)
         daily_rate = n_env / n_days
 
-        weekday_mult = _weekday_mult(env_records, window_start, as_of, daily_rate)
-
         amounts = [abs(record.signed_amount) for record in env_records]
-        if len(amounts) >= _MIN_AMOUNT_SAMPLE:
+        if len(amounts) >= envelope_min_amount_sample:
             amount_mu, amount_sigma = _lognormal_params(amounts)
         else:
             amount_mu, amount_sigma = pooled_mu, pooled_sigma
         amount_mu_by_env[envelope_id] = amount_mu
 
-        card_share = (
-            sum(1 for record in env_records if record.card_id is not None) / n_env
-            if n_env
-            else overall_card_share
-        )
-
         elasticity = _elasticity(
-            ledger, envelope_id, window_start, as_of, budgets.get(envelope_id, 10_000)
+            ledger,
+            envelope_id,
+            window_start,
+            as_of,
+            budgets.get(envelope_id, 10_000),
+            essential=envelope_id in _ESSENTIAL_ENVELOPE_IDS,
         )
 
         envelope_behaviors.append(
