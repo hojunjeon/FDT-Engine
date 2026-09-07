@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fdt"
+version = "0.1.0"
+description = "FDT 엔진: 금융 디지털 트윈 시뮬레이션 엔진 (LLM 의존성 0)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pydantic>=2",
+    "pyyaml",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "matplotlib",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+fdt = "fdt.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["fdt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
