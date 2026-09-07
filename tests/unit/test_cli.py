@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from fdt.cli import app
@@ -19,7 +20,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SEED_TWIN_INPUT = _REPO_ROOT / "data" / "seed" / "A_steady_7" / "twin_input.json"
 
 
-def test_build_then_inspect_then_run_error(tmp_path: Path) -> None:
+def test_build_then_inspect_then_run_forecast_ok(tmp_path: Path) -> None:
+    """W7 재개: FORECAST 러너가 등록됐으므로 `fdt run` 이 OK 로 끝난다
+    (이전엔 모드 러너가 하나도 없어 E-MODE-NOT_IMPLEMENTED 를 기대했다)."""
+
     engine_path = tmp_path / "A.engine.json"
 
     build_result = runner.invoke(
@@ -57,13 +61,65 @@ def test_build_then_inspect_then_run_error(tmp_path: Path) -> None:
             "42",
             "--out",
             str(result_path),
+            "--validate",
         ],
     )
-    # 이번 단계는 모드 러너가 없어 status=ERROR 로 끝나야 하고, CLI 는 그 경우
-    # 종료 코드 1 을 낸다(모드가 실제로 구현되면 이 기대치는 W7~W10 이 고친다).
+    assert run_result.exit_code == 0, run_result.output
+    assert result_path.exists()
+
+    result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result_payload["status"] == "OK"
+    assert result_payload["facts"], "FORECAST 결과에 facts 가 비어 있다"
+    assert result_payload["viz"], "FORECAST 결과에 viz 가 비어 있다"
+
+
+def test_run_error_mode_still_exits_one_and_writes_error_json(tmp_path: Path) -> None:
+    """아직 등록 안 된 모드(GOAL/OPTIMIZE)는 여전히 E-MODE-NOT_IMPLEMENTED,
+    종료 코드 1 이어야 한다 - `run` 이 FORECAST/RISK/WHATIF 를 구현했다고
+    이 경로 자체가 사라지면 안 된다."""
+
+    engine_path = tmp_path / "A.engine.json"
+    build_result = runner.invoke(
+        app, ["build", "--input", str(_SEED_TWIN_INPUT), "--out", str(engine_path)]
+    )
+    assert build_result.exit_code == 0, build_result.output
+
+    from fdt.engine.modes import MODE_RUNNERS, load_all
+    from fdt.engine.taxonomy import Mode
+
+    load_all()
+    not_yet_implemented = [m for m in Mode if m not in MODE_RUNNERS]
+    if not not_yet_implemented:
+        pytest.skip("다섯 모드가 전부 등록됐다(다른 작업자 완료) - 이 케이스는 검증할 게 없다")
+    mode = not_yet_implemented[0]
+
+    # `E-MODE-NOT_IMPLEMENTED` 는 `ModeRequest` 자체가 파싱된 뒤(모드별
+    # params 검증을 통과한 뒤)에야 도달하는 코드다 - GOAL/OPTIMIZE 는 필수
+    # params 가 있어(§8.4/8.6) 최소한의 유효 params 를 채워 넣어야 그
+    # 경로(러너 미등록)를 실제로 검증할 수 있다.
+    default_params: dict[str, str] = {
+        "GOAL": '{"goal_type":"ENVELOPE_ADHERE"}',
+        "OPTIMIZE": '{"objective":"MIN_SHORTFALL_PROB"}',
+    }
+    params_json = default_params.get(mode.value, "{}")
+
+    result_path = tmp_path / "err.json"
+    run_result = runner.invoke(
+        app,
+        [
+            "run",
+            "--engine",
+            str(engine_path),
+            "--mode",
+            mode.value,
+            "--params",
+            params_json,
+            "--out",
+            str(result_path),
+        ],
+    )
     assert run_result.exit_code == 1, run_result.output
     assert "E-MODE-NOT_IMPLEMENTED" in run_result.output
-    assert result_path.exists()
 
     result_payload = json.loads(result_path.read_text(encoding="utf-8"))
     assert result_payload["status"] == "ERROR"

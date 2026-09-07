@@ -25,6 +25,7 @@ from fdt.engine.taxonomy import ENVELOPE_IDS
 from fdt.gen import DEFAULT_END, DEFAULT_MONTHS, PROFILE_NAMES, write_profile
 from fdt.tools.engine_io import load_engine, save_engine
 from fdt.tools.schema_export import export_json_schemas
+from fdt.tools.validate import validate_result
 
 app = typer.Typer(help="FDT 엔진 테스트용 CLI")
 
@@ -301,12 +302,19 @@ def run_mode(
         None, "--params-file", help="params JSON 파일 경로"
     ),
     out: Path = typer.Option(..., "--out", help="EngineResult JSON 을 쓸 경로"),  # noqa: B008
+    validate: bool = typer.Option(
+        False, "--validate", help="결과를 `fdt/tools/validate.py` 로 검사하고 실패 시 종료 코드 1"
+    ),
 ) -> None:
     """ModeRequest 를 만들어 `Engine.run()` 을 호출한다 (SPEC 8~10장).
 
-    이번 단계(W5)는 `fdt.engine.modes.MODE_RUNNERS` 가 비어 있어 모든 모드가
-    `E-MODE-NOT_IMPLEMENTED` 로 끝난다. 결과 JSON 은 항상 `out` 에 쓰고,
-    `status=ERROR` 면 종료 코드 1 을 반환한다.
+    등록된 모드(FORECAST/RISK/WHATIF, 이후 GOAL/OPTIMIZE)는 `status=OK` 로
+    끝나고, 아직 러너가 없는 모드는 `E-MODE-NOT_IMPLEMENTED` 로 끝난다.
+    결과 JSON 은 항상 `out` 에 쓰고, `status=ERROR` 면 종료 코드 1 을
+    반환한다. `--validate` 를 주면 `status=OK` 인 결과에 한해
+    `fdt.tools.validate.validate_result()` 로 필수 facts/viz·구조를 추가로
+    검사하고, 검사가 실패하면(`ValidationReport.ok=False`) 종료 코드 1 로
+    끝낸다(SPEC 14 R7, PLAN Phase 6).
     """
 
     with _cli_error_guard():
@@ -364,6 +372,15 @@ def run_mode(
             assert result.error is not None
             typer.echo(f"ERROR {result.error.code}: {result.error.message}")
             raise typer.Exit(code=1)
+
+        if validate:
+            report = validate_result(result)
+            if not report.ok:
+                for err in report.errors:
+                    typer.echo(f"validate: {err}")
+                typer.echo(f"wrote {out} (validate 실패)")
+                raise typer.Exit(code=1)
+            typer.echo("validate: ok")
 
         typer.echo(f"wrote {out}")
 

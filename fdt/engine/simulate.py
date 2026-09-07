@@ -836,9 +836,18 @@ def simulate(
         economic[:, k] = (
             liquidity - _issued_unpaid_sum() - unpaid_obligation_cum - suppressed_demand_cum
         )
-        newly_short = (liquidity < 0) & (~any_shortfall)
+        # W7 최소 수정(오케스트레이터 결정, SPEC 7.2 8단계 "liquidity < 0 ->
+        # any_shortfall"의 실제 의미): `liquidity`(실제 잔액)는 모든 단계가
+        # "감당 못 하면 거절" 로 게이트돼 있어 구조적으로 절대 음수가 되지
+        # 않는다(W6 조사 노트, tests/unit/test_simulate.py 의
+        # test_profile_stats_invariants 주석 참조) - 그래서 `liquidity < 0`
+        # 를 그대로 쓰면 `shortfall_prob` 이 항상 0에 수렴해 RISK/FORECAST
+        # 어디에도 못 쓴다. SPEC 8.5 는 애초에 "부족"을 경제 잔액(청구서·
+        # 미납·억제 수요까지 반영한 잠재 부족)으로 정의하므로, 여기서는
+        # `economic`(이미 위에서 계산)을 판정 기준으로 쓴다.
+        newly_short = (economic[:, k] < 0) & (~any_shortfall)
         first_shortfall_idx[newly_short] = k
-        any_shortfall |= liquidity < 0
+        any_shortfall |= economic[:, k] < 0
 
     event_log = [DayEvents(date=dates[k], events=events_by_day[k]) for k in sorted(events_by_day)]
 

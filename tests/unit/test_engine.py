@@ -293,7 +293,10 @@ def test_fork_meta_warnings_are_independent(engines_3m):
 # ---------------------------------------------------------------------------
 
 
-def test_run_returns_error_result_for_unimplemented_mode_without_raising(engines_3m):
+def test_run_forecast_ok_with_nonempty_facts_and_viz(engines_3m):
+    """W7 재개: `run()` 이 러너 -> `build_facts` -> `build_viz` 로 이어붙는지
+    (완료 조건 "run FORECAST/RISK OK facts/viz 비어있지 않음")."""
+
     engine = engines_3m["A_steady"]
     req = ModeRequest(
         mode="FORECAST", params={"include_envelopes": True, "include_events": True}
@@ -301,11 +304,46 @@ def test_run_returns_error_result_for_unimplemented_mode_without_raising(engines
 
     result = engine.run(req)
 
+    assert result.status == "OK"
+    assert result.result is not None
+    assert result.error is None
+    assert result.facts, "FORECAST OK 인데 facts 가 비어 있다"
+    assert result.viz, "FORECAST OK 인데 viz 가 비어 있다"
+    assert result.meta.engine_id == engine.meta.engine_id
+    assert result.meta.mode.value == "FORECAST"
+
+
+def test_run_risk_ok_with_nonempty_facts_and_viz(engines_3m):
+    engine = engines_3m["A_steady"]
+    req = ModeRequest(mode="RISK", params={})
+
+    result = engine.run(req)
+
+    assert result.status == "OK"
+    assert result.result is not None
+    assert result.error is None
+    assert result.facts, "RISK OK 인데 facts 가 비어 있다"
+    assert result.viz, "RISK OK 인데 viz 가 비어 있다"
+
+
+def test_run_returns_error_when_mode_runner_is_missing(monkeypatch, engines_3m):
+    """완료 조건 "레지스트리에서 임시 제거 시 ERROR": 등록되지 않은 모드는
+    러너 존재 여부와 무관하게 `E-MODE-NOT_IMPLEMENTED` 로 끝나야 한다 -
+    FORECAST 러너를 잠깐 지워서 그 경로 자체를 검증한다(GOAL/OPTIMIZE 처럼
+    아직 등록 안 된 모드에 기대는 대신, 언제든 재현 가능한 방식)."""
+
+    engine = engines_3m["A_steady"]
+    monkeypatch.delitem(MODE_RUNNERS, Mode.FORECAST, raising=True)
+
+    req = ModeRequest(mode="FORECAST", params={})
+    result = engine.run(req)
+
     assert result.status == "ERROR"
     assert result.result is None
+    assert result.facts == []
+    assert result.viz == []
     assert result.error is not None
     assert result.error.code == E_MODE_NOT_IMPLEMENTED
-    assert result.meta.engine_id == engine.meta.engine_id
     assert result.meta.mode.value == "FORECAST"
 
 
@@ -361,6 +399,16 @@ def test_run_wraps_validation_error_via_extract_errors(monkeypatch, engines_3m):
 
 
 def test_run_does_not_raise_for_every_mode(engines_3m):
+    """다섯 모드 전부 예외 없이 `EngineResult` 를 낸다. 이 저장소는 여러
+    작업자(W7~W10)가 동시에 모드 러너를 채우는 중이라, 아직 등록되지 않은
+    모드는 `E-MODE-NOT_IMPLEMENTED` ERROR 여야 하고, 이미 등록된 모드는
+    OK(+facts/viz 존재) 여야 한다 - 어느 쪽이 맞는지는 `MODE_RUNNERS` 를
+    실제로 읽어 판단한다(다른 작업자 완료 여부에 이 테스트가 깨지지 않게).
+    """
+
+    from fdt.engine.modes import load_all
+
+    load_all()
     engine = engines_3m["A_steady"]
     requests = [
         ModeRequest(mode="FORECAST", params={}),
@@ -382,8 +430,13 @@ def test_run_does_not_raise_for_every_mode(engines_3m):
     ]
     for req in requests:
         result = engine.run(req)
-        assert result.status == "ERROR"
-        assert result.error.code == E_MODE_NOT_IMPLEMENTED
+        if req.mode in MODE_RUNNERS:
+            assert result.status == "OK", (req.mode, result.error)
+            assert result.facts
+            assert result.viz
+        else:
+            assert result.status == "ERROR"
+            assert result.error.code == E_MODE_NOT_IMPLEMENTED
 
 
 # ---------------------------------------------------------------------------

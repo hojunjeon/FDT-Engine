@@ -12,6 +12,27 @@ fdt/engine/** 전체를 읽어 다음을 검사한다.
     `time` 은 SPEC §4.2-2(리뷰 S12) 에 따라 `time.perf_counter` 호출만 허용한다.
     그 외 `time.*` 호출, `import time` 이외의 time 심볼 import(`from time import
     time` 등)는 전부 금지한다. `elapsed_ms` 계측용 `perf_counter` 만 예외.
+
+    **명시적 예외 (W7 재개, SPEC 4.2-5 "다섯 모드는 모두 simulate() 하나를
+    호출한다" 의 레지스트리 구현).** `fdt/engine/modes/__init__.py` 의
+    `load_all()` 은 `pkgutil.iter_modules` 로 얻은 이름을
+    `importlib.import_module(...)` 로 불러 모드 러너 등록을 트리거한다 -
+    이건 LLM/HTTP 접근을 동적 import 로 우회하는 것이 아니라, 그 파일
+    자신이 속한 `fdt.engine.modes` 패키지의 서브모듈만 로드하는 순수
+    배선(wiring) 코드다. 그래서 이 한 파일에 한해 `import_module(...)`
+    (⚠ `__import__`/`hash` 는 계속 금지) 호출을 허용하되, "아무 동적 import나
+    다 허용"이 되지 않도록 두 조건을 **AST로 직접** 확인한 경우에만
+    예외를 준다(`_is_scoped_modes_loader` 참조):
+      1. 위반 후보 노드가 있는 파일이 정확히
+         `fdt/engine/modes/__init__.py` 여야 한다(다른 파일은 예외 없음).
+      2. 그 파일 안에 `pkgutil.iter_modules(..., prefix=f"{__name__}.")`
+         형태의 호출(즉 `f"{__name__}."` 리터럴 접두어로 스캔 대상을
+         이 패키지 자신의 서브모듈로 한정하는 코드)이 실제로 존재해야
+         한다 - 이 리터럴이 "접두어 `fdt.engine.modes.` 로 시작하는
+         이름만 동적 import 한다"는 정적 증거다(패키지 경로가 바뀌면
+         `__name__` 도 같이 바뀌므로 이 조건은 이름이 아니라 구조로
+         검사한다). 이 증거가 없으면 여느 `import_module` 호출과
+         동일하게 반려된다.
 (b) 금지 문자열("ground_truth", "hidden_params", "yaml")이 없다(순환 검증 금지,
     엔진이 생성기의 정답/숨김 파라미터를 읽지 않는다는 증거). 이 검사는
     대소문자 무시 전체 문자열(주석·docstring 포함) 검색이다 - 예를 들어
@@ -71,6 +92,52 @@ _FORBIDDEN_IO_SUBSTRINGS = [
     "sys.stderr",
 ]
 
+# 위 docstring "명시적 예외" 가 허용하는 유일한 파일. 이 파일 밖에서는
+# `import_module`/`__import__` 가 전부 그대로 금지된다.
+_MODES_LOADER_REL = Path("fdt") / "engine" / "modes" / "__init__.py"
+
+
+def _is_dunder_name_prefix_fstring(node: ast.AST) -> bool:
+    """`f"{__name__}."` 형태(값이 `__name__` 뿐이고 뒤에 리터럴 "." 만 붙는
+    f-string)인지 검사한다. 이 모양이어야 "이 패키지 자신의 서브모듈"로
+    스캔 범위가 고정된다는 정적 증거가 된다."""
+
+    if not isinstance(node, ast.JoinedStr) or len(node.values) != 2:
+        return False
+    head, tail = node.values
+    return (
+        isinstance(head, ast.FormattedValue)
+        and isinstance(head.value, ast.Name)
+        and head.value.id == "__name__"
+        and isinstance(tail, ast.Constant)
+        and tail.value == "."
+    )
+
+
+def _has_scoped_iter_modules_call(tree: ast.AST) -> bool:
+    """`pkgutil.iter_modules(..., prefix=f"{__name__}.")` 호출이 있는지 찾는다."""
+
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "iter_modules":
+            continue
+        for kw in node.keywords:
+            if kw.arg == "prefix" and _is_dunder_name_prefix_fstring(kw.value):
+                return True
+        # 위치 인자로 넘겼을 가능성(현재 코드는 키워드지만 방어적으로 포함).
+        if len(node.args) >= 2 and _is_dunder_name_prefix_fstring(node.args[1]):
+            return True
+    return False
+
+
+def _is_scoped_modes_loader(rel: Path, tree: ast.AST) -> bool:
+    """이 파일이 `fdt/engine/modes/__init__.py` 이고, 그 안에
+    패키지 자신으로 스캔 범위를 고정하는 `iter_modules` 호출이 실제로
+    있을 때만 `True`(= `import_module` 예외 적용 대상)."""
+
+    return rel == _MODES_LOADER_REL and _has_scoped_iter_modules_call(tree)
+
 
 def _engine_py_files() -> list[Path]:
     if not ENGINE_DIR.exists():
@@ -99,6 +166,11 @@ def _check_ast_violations(path: Path, tree: ast.AST) -> list[str]:
     except ValueError:
         # 회귀 테스트가 실제 저장소에 없는 가상 경로를 넘기는 경우.
         rel = path
+
+    # `import_module` 예외는 파일 전체에 한 번만 판단한다(위 docstring
+    # "명시적 예외" 참조) - 이 파일이 아니면 항상 `False` 라 다른 모든
+    # 엔진 파일의 동적 import 는 종전대로 그대로 걸린다.
+    allow_scoped_import_module = _is_scoped_modes_loader(rel, tree)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -141,7 +213,10 @@ def _check_ast_violations(path: Path, tree: ast.AST) -> list[str]:
                 call_name = func.attr
 
             if call_name in _FORBIDDEN_CALL_NAMES:
-                violations.append(f"{rel}:{node.lineno}: {call_name}(...) 호출 금지")
+                if call_name == "import_module" and allow_scoped_import_module:
+                    pass  # 위 "명시적 예외" 조건을 만족한 이 한 파일만 통과.
+                else:
+                    violations.append(f"{rel}:{node.lineno}: {call_name}(...) 호출 금지")
 
             # time.<anything>() 은 perf_counter 만 허용.
             if isinstance(func, ast.Attribute) and call_name is not None:
@@ -177,6 +252,50 @@ def test_no_forbidden_imports_in_engine():
         tree = ast.parse(text, filename=str(path))
         violations.extend(_check_ast_violations(path, tree))
     assert not violations, "fdt/engine/ 에 금지 import/호출 발견:\n" + "\n".join(violations)
+
+
+def test_modes_loader_import_module_exception_is_narrow():
+    """`import_module` 예외(위 docstring "명시적 예외")가 모든
+    `fdt/engine/modes/__init__.py` 의 `import_module` 호출을 아무렇게나
+    통과시키지 않고, 정확히 두 조건(파일 위치 + `iter_modules` 의
+    `f"{__name__}."` 스코프 증거)에 걸려 있는지 회귀로 고정한다."""
+
+    scoped_src = (
+        "import importlib\n"
+        "import pkgutil\n"
+        "def load_all():\n"
+        "    package = importlib.import_module(__name__)\n"
+        "    for m in pkgutil.iter_modules(package.__path__, prefix=f'{__name__}.'):\n"
+        "        importlib.import_module(m.name)\n"
+    )
+    tree = ast.parse(scoped_src)
+    violations = _check_ast_violations(Path("fdt/engine/modes/__init__.py"), tree)
+    assert not violations, (
+        f"실제 modes/__init__.py 와 같은 스코프 증거가 있는데 걸렸다: {violations}"
+    )
+
+    # 조건 1 위반: 같은 코드라도 다른 파일이면 예외를 받지 못한다.
+    violations_wrong_file = _check_ast_violations(
+        Path("fdt/engine/behavior.py"), tree
+    )
+    assert any("import_module" in v for v in violations_wrong_file), (
+        "modes/__init__.py 가 아닌 파일은 같은 코드라도 여전히 걸려야 한다"
+    )
+
+    # 조건 2 위반: 파일 위치는 맞지만 `iter_modules` 스코프 증거(prefix
+    # f"{__name__}.")가 없으면(예: 아무 이름이나 동적 import) 여전히 걸린다.
+    unscoped_src = (
+        "import importlib\n"
+        "def load_all():\n"
+        "    importlib.import_module('requests')\n"
+    )
+    unscoped_tree = ast.parse(unscoped_src)
+    violations_unscoped = _check_ast_violations(
+        Path("fdt/engine/modes/__init__.py"), unscoped_tree
+    )
+    assert any("import_module" in v for v in violations_unscoped), (
+        "iter_modules 스코프 증거 없이 아무 이름이나 import_module 하면 걸려야 한다"
+    )
 
 
 def test_forbidden_import_ast_check_catches_bypass_cases():

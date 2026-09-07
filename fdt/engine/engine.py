@@ -34,8 +34,9 @@ from fdt.engine.errors import (
     FdtWarning,
     extract_errors,
 )
+from fdt.engine.facts import build_facts
 from fdt.engine.ledger import LedgerTx, account_balance_at, history_days, normalize, reconcile
-from fdt.engine.modes import MODE_RUNNERS
+from fdt.engine.modes import MODE_RUNNERS, load_all
 from fdt.engine.schemas.behavior import Behavior
 from fdt.engine.schemas.input import Externals, TwinInput
 from fdt.engine.schemas.request import ModeRequest
@@ -45,6 +46,7 @@ from fdt.engine.schemas.result import EngineResult, ResultWarning
 from fdt.engine.schemas.state import State
 from fdt.engine.state import build_state_with_warnings
 from fdt.engine.taxonomy import ConfirmStatus, ExcludeTag, Flow
+from fdt.engine.viz import build_viz
 
 __all__ = ["Engine", "EngineBuildMeta", "build_engine"]
 
@@ -166,14 +168,22 @@ class Engine:
     def run(self, req: ModeRequest) -> EngineResult:
         """모드 디스패치 (SPEC 8~9장).
 
-        이번 단계에는 `fdt.engine.modes.MODE_RUNNERS` 가 비어 있으므로 모든
-        요청이 `E-MODE-NOT_IMPLEMENTED` 오류로 끝난다. 러너가 등록되면
-        `runner(self, req)` 가 모드별 `ResultUnion` 하나를 만들어 낸다.
-        측정에는 SPEC 4.2-2 가 허용하는 `time.perf_counter()` 만 쓴다.
+        `load_all()` 로 `fdt.engine.modes.*` 를 (첫 호출에서만) 로드해
+        레지스트리를 채운 뒤, `req.mode` 러너를 찾아 `runner(self, req)` 를
+        호출한다 - 다섯 모드 전부 `simulate()` 하나만 부른다(SPEC 4.2-5).
+        러너가 없는 모드(아직 구현되지 않은 모드)는 `E-MODE-NOT_IMPLEMENTED`
+        오류로 끝난다. 성공하면 그 result 로 `build_facts`/`build_viz` 를
+        만들어 §9.2/§9.3 계약대로 채운다(재계산 없이 result 값만 뽑는다 -
+        모드 러너의 결정을 여기서 다시 계산하지 않는다). 측정에는 SPEC
+        4.2-2 가 허용하는 `time.perf_counter()` 만 쓴다.
         """
+
+        load_all()
 
         start = time.perf_counter()
         result = None
+        facts: list[Any] = []
+        viz: list[Any] = []
         error: ResultEngineError | None = None
         status: str = "OK"
         try:
@@ -184,6 +194,8 @@ class Engine:
                     details={"mode": req.mode.value},
                 )
             result = runner(self, req)
+            facts = build_facts(req.mode, result, as_of=self.meta.as_of)
+            viz = build_viz(req.mode, result, facts, as_of=self.meta.as_of)
         except FdtError as exc:
             status = "ERROR"
             error = ResultEngineError(code=exc.code, message=exc.message, details=exc.details)
@@ -231,8 +243,8 @@ class Engine:
             meta=result_meta,
             request=req,
             result=result,
-            facts=[],
-            viz=[],
+            facts=facts,
+            viz=viz,
             status=status,  # type: ignore[arg-type]
             error=error,
         )
