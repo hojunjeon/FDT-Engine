@@ -154,6 +154,73 @@ def test_reproducibility_byte_identical(engines_3m: dict[str, Engine]) -> None:
     assert np.array_equal(r1.card_shortfall, r2.card_shortfall)
 
 
+def test_regular_income_profile_untouched_by_s48(engines_3m: dict[str, Engine]) -> None:
+    """S48(리뷰 U1)은 **불규칙** 수입(`income.irregular=True`)의 다음 입금일에만
+    간격 잡음을 추가한다. 규칙적 수입(SALARY, A/B/D 프로필) 은 여전히
+    결정론이어야 한다 - 두 가지를 함께 확인한다.
+
+    1. A 프로필 결과가 재현 가능하다(바이트 동일, 기존 CRN 불변식).
+    2. S48 이 새로 추가한 `rng_main.normal(...)` 호출(수입 간격 잡음
+       전용, `simulate.py` 전체에서 이 한 곳에만 쓰인다)이 규칙적 수입
+       프로필에서는 **한 번도** 일어나지 않는다 - "규칙적 수입 프로필에서는
+       난수를 소비하지 않는다"(작업 지시)를 직접 검증한다. `numpy.random.
+       Generator` 는 Cython 확장형이라 인스턴스 메서드를 직접 monkeypatch할
+       수 없으므로, `np.random.default_rng` 자체를 감싸는 위임 래퍼로 호출
+       횟수만 센다(실제 난수 생성은 그대로 진행되므로 결과에 영향 없음).
+    """
+
+    engine = engines_3m["A_steady"]
+    assert engine.state.income.irregular is False  # 전제(SALARY) 확인
+
+    r1 = simulate(
+        engine.state, engine.behavior, engine.externals, horizon_days=30, n_paths=200, seed=42
+    )
+    r2 = simulate(
+        engine.state, engine.behavior, engine.externals, horizon_days=30, n_paths=200, seed=42
+    )
+    assert np.array_equal(r1.balances, r2.balances)
+    assert np.array_equal(r1.economic, r2.economic)
+    assert np.array_equal(r1.envelope_spend, r2.envelope_spend)
+    assert np.array_equal(r1.any_shortfall, r2.any_shortfall)
+    assert np.array_equal(r1.card_shortfall, r2.card_shortfall)
+
+    normal_call_count = 0
+    real_default_rng = np.random.default_rng
+
+    class _CountingGenerator:
+        def __init__(self, real: np.random.Generator) -> None:
+            self._real = real
+
+        def normal(self, *args: object, **kwargs: object) -> np.ndarray:
+            nonlocal normal_call_count
+            normal_call_count += 1
+            return self._real.normal(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real, name)
+
+    def _patched_default_rng(seed: object = None) -> _CountingGenerator:
+        return _CountingGenerator(real_default_rng(seed))
+
+    np.random.default_rng = _patched_default_rng
+    try:
+        simulate(
+            engine.state,
+            engine.behavior,
+            engine.externals,
+            horizon_days=30,
+            n_paths=200,
+            seed=42,
+        )
+    finally:
+        np.random.default_rng = real_default_rng
+
+    assert normal_call_count == 0, (
+        "규칙적 수입(SALARY) 프로필이 S48 의 간격 잡음(rng_main.normal)을 "
+        f"소비했다({normal_call_count}회) - CRN 을 깬다"
+    )
+
+
 def test_zero_rate_zero_shock_is_deterministic_staircase() -> None:
     """daily_rate=0, shock=0 -> 전 경로 동일 계단, 큐·수입만 반영 (완료 조건)."""
 
@@ -743,6 +810,55 @@ def test_b_holdout_smape_sanity_and_coverage() -> None:
     # PLAN §5.5 backtest 는 Phase 7 정식 평가의 몫이다. 여기서는 시뮬레이터가
     # 정답과 완전히 무관하지 않다는 것만 느슨하게 확인한다.
     assert coverage >= 0.4
+
+
+def test_c_holdout_smape_sanity_5_seeds() -> None:
+    """S48(리뷰 U1) 이후 C 프로필의 느슨한 sanity - 엄격한 SPEC §12 기준(≤
+    .40, 5/5)은 K3 의 `fdt eval backtest` 몫이다(작업 지시서 참조). 여기서는
+    "5시드 중 3시드 이상 sMAPE ≤ 0.6" 만 확인한다 - S48 적용 전(간격잡음 없이
+    전 경로가 같은 날 입금)에는 커버리지가 5시드 중 4회 0.6 이하로 좁았고
+    (리뷰 20260907_W6_W10.md 항목 2), S48 적용 후 실측(보고서 표 참조)으로는
+    coverage 평균이 0.72 -> 0.87 로 넓어졌지만 sMAPE 자체는 여전히 기준(.40)을
+    크게 웃돈다(C 는 median 잔액이 1천~5천원대라 부호가 뒤집히면 sMAPE 가
+    쉽게 폭발한다) - 그래서 여기서는 완전한 통과가 아니라 최소 절반은
+    "터무니없지 않다"는 느슨한 하한만 잠근다.
+
+    분모에 SPEC §12 가 언급하는 100,000원 epsilon 을 더한다 - 위
+    test_b_holdout_smape_sanity_and_coverage 의 "분모 0 이면 1.0" 관례는 B
+    (잔액 수십만원)에는 충분하지만 C(median 잔액이 1천원 단위)에는 sMAPE 를
+    불안정하게 만든다는 것 자체가 이번 재측정에서 드러난 사실이다."""
+
+    seeds = [1, 3, 5, 7, 11]
+    passes = 0
+    for seed in seeds:
+        twin, _raw, ground_truth = generate("C_impulsive", seed=seed, months=6)
+        holdout_as_of = twin.as_of - __import__("datetime").timedelta(days=30)
+        engine = build_engine(twin, as_of=holdout_as_of)
+        primary_id = next(a.id for a in engine.state.accounts if a.role == "PRIMARY")
+
+        res = simulate(
+            engine.state,
+            engine.behavior,
+            engine.externals,
+            horizon_days=30,
+            n_paths=1000,
+            seed=42,
+        )
+        stats = res.stats()
+
+        daily_balance = ground_truth["daily_balance"]
+        actual = np.array(
+            [daily_balance[d.isoformat()][str(primary_id)] for d in res.dates[1:]],
+            dtype=np.float64,
+        )
+        predicted_median = np.array(stats.median[1:], dtype=np.float64)
+        denom = np.abs(actual) + np.abs(predicted_median) + 100_000
+        smape = float(np.mean(2 * np.abs(actual - predicted_median) / denom))
+        print(f"\n[C holdout sanity] seed={seed} sMAPE={smape:.4f}")
+        if smape <= 0.6:
+            passes += 1
+
+    assert passes >= 3, f"C 5시드 중 sMAPE<=0.6 통과가 {passes}/5 뿐이다"
 
 
 # ---------------------------------------------------------------------------

@@ -35,6 +35,7 @@ from datetime import date, timedelta
 from typing import Literal
 
 from fdt.engine import ledger as ledger_mod
+from fdt.engine._dateutil import add_months, clamped_month_date
 from fdt.engine.errors import W_FIXED_VARIABLE_UNKNOWN, FdtWarning
 from fdt.engine.ledger import LedgerTx
 from fdt.engine.schemas.input import CardIn, FixedExpenseIn, LoanIn, TwinInput
@@ -105,19 +106,17 @@ _TRANSFER_AMOUNT_TOLERANCE_PCT = 0.10
 
 
 # ---------------------------------------------------------------------------
-# 날짜 헬퍼
+# 날짜 헬퍼 (리뷰 N10: `_clamped_month_date`/`_add_month` 사본을 공용
+# `fdt/engine/_dateutil.py`(J2) 로 교체했다. `_next_month` 만 이 모듈에 남긴다
+# - `add_months(d, n)` 는 `d.day` 를 앵커로 쓰므로, "day_of_month 를 고정하고
+# 월만 넘긴다" 패턴에는 매번 day=1 인 날짜로 호출해야 앵커 일자 드리프트가
+# 없다(1일은 모든 달에 유효해 클램프가 절대 일어나지 않는다).)
 # ---------------------------------------------------------------------------
 
 
-def _clamped_month_date(year: int, month: int, day: int) -> date:
-    last_day = calendar.monthrange(year, month)[1]
-    return date(year, month, min(day, last_day))
-
-
-def _add_month(year: int, month: int) -> tuple[int, int]:
-    if month == 12:
-        return year + 1, 1
-    return year, month + 1
+def _next_month(year: int, month: int) -> tuple[int, int]:
+    nxt = add_months(date(year, month, 1), 1)
+    return nxt.year, nxt.month
 
 
 def _first_weekday_on_or_after(d: date, weekday: int) -> date:
@@ -131,16 +130,16 @@ def _monthly_due_dates(anchor_day: int, as_of: date, horizon_cap: int) -> list[d
 
     end = as_of + timedelta(days=horizon_cap)
     year, month = as_of.year, as_of.month
-    candidate = _clamped_month_date(year, month, anchor_day)
+    candidate = clamped_month_date(year, month, anchor_day)
     if candidate <= as_of:
-        year, month = _add_month(year, month)
-        candidate = _clamped_month_date(year, month, anchor_day)
+        year, month = _next_month(year, month)
+        candidate = clamped_month_date(year, month, anchor_day)
 
     dates: list[date] = []
     while candidate <= end:
         dates.append(candidate)
-        year, month = _add_month(year, month)
-        candidate = _clamped_month_date(year, month, anchor_day)
+        year, month = _next_month(year, month)
+        candidate = clamped_month_date(year, month, anchor_day)
     return dates
 
 
@@ -748,7 +747,7 @@ def _completed_months(ledger_upto: tuple[LedgerTx, ...], as_of: date) -> list[tu
         out.append((start, end))
         if year == as_of.year and month == as_of.month:
             break
-        year, month = _add_month(year, month)
+        year, month = _next_month(year, month)
     return out
 
 

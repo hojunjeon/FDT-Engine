@@ -91,7 +91,7 @@
 
 각 단계는 "산출물 / 완료 조건 / 검토 포인트" 를 가진다. 단계 완료 시 §7 리뷰 절차를 거친다.
 
-### Phase 0. 골격과 계약 (D0 ~ D1)
+### Phase 0. 골격과 계약 (D0 ~ D1) [완료 2026-09-07]
 
 산출물
 - `pyproject.toml`, 패키지 골격, `ruff/mypy/pytest` 설정, `README.md`(실행법).
@@ -105,7 +105,7 @@
 
 검토 포인트: SPEC §3.2 예시 JSON 이 그대로 검증을 통과하는가. 모드 params 의 필수/선택이 SPEC 과 일치하는가.
 
-### Phase 1. 데이터 생성기와 원장 (D1 ~ D3)
+### Phase 1. 데이터 생성기와 원장 (D1 ~ D3) [완료 2026-09-07]
 
 산출물
 - `gen/generator.py` + 4 프로필 YAML. 하루 처리 순서는 SPEC §7.2 와 동일(생성기가 시뮬레이터의 정답 분포).
@@ -120,7 +120,7 @@
 
 검토 포인트: 생성기 처리 순서와 SPEC §7.2 를 나란히 놓고 대조. D_goal_saver 가 GOAL/OPTIMIZE 를 실제로 자극하는 수치인지(구독 5개, 12월 목표가 아슬아슬하게 불가능).
 
-### Phase 2. State · Behavior · 엔진 빌드 (D3 ~ D5)
+### Phase 2. State · Behavior · 엔진 빌드 (D3 ~ D5) [완료 2026-09-07]
 
 산출물
 - `engine/state.py`: PRIMARY/EMERGENCY 판정, unbilled/issued_unpaid, 약정 큐(§5.4), 예산 소스 우선순위, 엔진 제안(§5.5), 지표.
@@ -137,7 +137,7 @@
 
 검토 포인트: 예산 소스 우선순위(CONFIRMED > PROPOSED > ENGINE)가 D 프로필에서 실제 CONFIRMED 를 쓰는가. `is_variable` 고정비 0원 경고가 facts 로 이어질 준비가 됐는가.
 
-### Phase 3. 시뮬레이터 + FORECAST + RISK (D5 ~ D8)
+### Phase 3. 시뮬레이터 + FORECAST + RISK (D5 ~ D8) [완료 2026-09-07]
 
 산출물
 - `engine/simulate.py`: §7.2 8단계 벡터화, `overrides`, `injections`, `event_log`, `stats`, `payment_risks`.
@@ -155,7 +155,7 @@
 
 검토 포인트: 경제 잔액 정의(§7.2 8단계)가 RISK 판정에 쓰이는지, FORECAST 궤적은 실제 잔액인지 구분이 코드에 명확한가. `event_log` 의 성공 비율이 `payment_risks` 와 이중 계산되지 않는가.
 
-### Phase 4. WHATIF + GOAL (D8 ~ D11)
+### Phase 4. WHATIF + GOAL (D8 ~ D11) [완료 2026-09-07]
 
 산출물
 - `modes/whatif.py`: 7 종 주입(§8.3 표), CRN, 델타, 판정.
@@ -171,7 +171,7 @@
 
 검토 포인트: CRN 이 `injections` 유무에 따라 난수 소비 순서를 바꾸지 않는지(주입 단계가 별도 rng 스트림을 쓰는지). GOAL 의 확정 유입 계산이 시뮬레이터의 수입 일정 함수를 **재사용**하는지(중복 구현 금지).
 
-### Phase 5. OPTIMIZE (D11 ~ D13)
+### Phase 5. OPTIMIZE (D11 ~ D13) [완료 2026-09-07]
 
 산출물
 - `modes/optimize.py`: AUTO 후보 생성(§8.6.1), 단일 평가 → 상위 k → 그리디 조합, 시뮬 예산 ≤ 40, n_paths 자동 하향, `cost_of_action`/`feasibility_note`.
@@ -187,7 +187,7 @@
 
 검토 포인트: 조합 평가에 CRN 을 유지하는가(기준과 같은 시드). `cost_of_action` 문구가 facts 값만 쓰는가.
 
-### Phase 6. 출력 계약 마감: facts · viz · validate · render (D13 ~ D15)
+### Phase 6. 출력 계약 마감: facts · viz · validate · render (D13 ~ D15) [골든 스냅샷 제외 완료]
 
 산출물
 - `facts.py` 완성: 모드별 필수 facts(§9.4), `allowed_renderings` 생성 규칙(원 단위·만원·약 표기·상대 날짜).
@@ -203,7 +203,7 @@
 
 검토 포인트: viz 에 색상·픽셀·라이브러리명이 없는가. facts 의 확률 단위가 모드 내 통일인가(M1).
 
-### Phase 7. 평가와 QA 마감 (D15 ~ D18)
+### Phase 7. 평가와 QA 마감 (D15 ~ D18) [진행 중]
 
 산출물
 - `eval/backtest.py`(sMAPE, 최저점 오차, 커버리지), `eval/calibration.py`(ECE, Brier, 구간 표본), `eval/monotonic.py`, `eval/report.py`(마크다운 표).
@@ -218,24 +218,24 @@
 
 파일 소유를 나눠 병렬 투입한다. 한 작업은 자기 소유 파일과 자기 테스트만 수정한다. 공용 파일(`schemas/*`, `taxonomy.py`, `errors.py`)은 Phase 0 에서 잠그고, 변경은 "설계 변경" 커밋으로 따로 낸다.
 
-| 작업 ID | 소유 파일 | 선행 | 예상 |
-| --- | --- | --- | --- |
-| W0 골격·스키마 | `pyproject`, `schemas/*`, `taxonomy`, `errors`, `test_architecture` | 없음 | 1일 |
-| W1 생성기 | `gen/*`, `tests/unit/test_generator.py` | W0 | 2일 |
-| W2 원장 | `engine/ledger.py`, `test_ledger.py` | W0 | 1일 (W1 과 병렬) |
-| W3 State | `engine/state.py`, `test_state.py` | W1, W2 | 1.5일 |
-| W4 Behavior | `engine/behavior.py`, `test_behavior.py` | W1, W2 | 1일 (W3 과 병렬) |
-| W5 엔진 빌드·CLI 기본 | `engine/engine.py`, `cli.py`(gen/build/inspect), `test_engine.py`, `test_cli.py` | W3, W4 | 1일 |
-| W6 시뮬레이터 | `engine/simulate.py`, `test_simulate.py` | W3, W4 | 2일 |
-| W7 FORECAST·RISK | `modes/forecast.py`, `modes/risk.py`, 해당 테스트 | W6 | 1.5일 |
-| W8 WHATIF | `modes/whatif.py`, 테스트 | W6 | 1.5일 (W7 과 병렬) |
-| W9 GOAL | `modes/goal.py`, 테스트 | W6, W8(BUDGET_CHANGE 주입 재사용) | 1.5일 |
-| W10 OPTIMIZE | `modes/optimize.py`, 테스트 | W8, W9 | 2일 |
-| W11 facts·viz | `facts.py`, `viz.py`, `test_facts.py`, `test_viz.py` | W7~W10 결과 스키마 확정 시점부터, 모드별 점진 | 2일 |
-| W12 validate·render | `tools/*`, `test_validate_render.py` | W11 | 1.5일 |
-| W13 속성·골든·통합 | `tests/property`, `tests/golden`, `tests/integration` | W7~W12 | 1.5일 |
-| W14 평가 | `eval/*` | W7 (backtest·calibration), W8 (monotonic) | 2일 |
-| W15 QA·문서 | `docs/QA_REPORT.md`, `README.md`, `docs/reviews/` | 전부 | 1.5일 |
+| 작업 ID | 소유 파일 | 선행 | 예상 | 상태 |
+| --- | --- | --- | --- | --- |
+| W0 골격·스키마 | `pyproject`, `schemas/*`, `taxonomy`, `errors`, `test_architecture` | 없음 | 1일 | 완료 |
+| W1 생성기 | `gen/*`, `tests/unit/test_generator.py` | W0 | 2일 | 완료 |
+| W2 원장 | `engine/ledger.py`, `test_ledger.py` | W0 | 1일 (W1 과 병렬) | 완료 |
+| W3 State | `engine/state.py`, `test_state.py` | W1, W2 | 1.5일 | 완료 |
+| W4 Behavior | `engine/behavior.py`, `test_behavior.py` | W1, W2 | 1일 (W3 과 병렬) | 완료 |
+| W5 엔진 빌드·CLI 기본 | `engine/engine.py`, `cli.py`(gen/build/inspect), `test_engine.py`, `test_cli.py` | W3, W4 | 1일 | 완료 |
+| W6 시뮬레이터 | `engine/simulate.py`, `test_simulate.py` | W3, W4 | 2일 | 완료 |
+| W7 FORECAST·RISK | `modes/forecast.py`, `modes/risk.py`, 해당 테스트 | W6 | 1.5일 | 완료 |
+| W8 WHATIF | `modes/whatif.py`, 테스트 | W6 | 1.5일 (W7 과 병렬) | 완료 |
+| W9 GOAL | `modes/goal.py`, 테스트 | W6, W8(BUDGET_CHANGE 주입 재사용) | 1.5일 | 완료 |
+| W10 OPTIMIZE | `modes/optimize.py`, 테스트 | W8, W9 | 2일 | 완료 |
+| W11 facts·viz | `facts.py`, `viz.py`, `test_facts.py`, `test_viz.py` | W7~W10 결과 스키마 확정 시점부터, 모드별 점진 | 2일 | 완료 |
+| W12 validate·render | `tools/*`, `test_validate_render.py` | W11 | 1.5일 | 완료 |
+| W13 속성·골든·통합 | `tests/property`, `tests/golden`, `tests/integration` | W7~W12 | 1.5일 | 진행 중(골든 제외) |
+| W14 평가 | `eval/*` | W7 (backtest·calibration), W8 (monotonic) | 2일 | 진행 중 |
+| W15 QA·문서 | `docs/QA_REPORT.md`, `README.md`, `docs/reviews/` | 전부 | 1.5일 | 미착수 |
 
 병렬 규칙
 - 함수 시그니처는 SPEC 이 계약이다. 시그니처를 바꾸려면 SPEC 수정 커밋을 먼저 낸다.
@@ -385,6 +385,12 @@ QA 마감 전, SPEC §3.3, §8.1~8.6, §9.4, §12 의 표를 한 줄씩 체크�
 4. Phase 3, 5, 7 종료 시점에 전체 리뷰(아키텍처·불변식·성능)를 한 번씩 한다.
 5. 코딩 에이전트가 구현한 코드는 다른 모델 또는 사람이 리뷰한다. 자기 리뷰만으로 통과시키지 않는다.
 
+**수행 기록**
+- `docs/reviews/20260907_W0.md`
+- `docs/reviews/20260907_W1_W2.md`
+- `docs/reviews/20260907_W3_W4_W5.md`
+- `docs/reviews/20260907_W6_W10.md`
+
 ---
 
 ## 8. 코드 리뷰 체크리스트
@@ -446,10 +452,10 @@ QA 마감 전, SPEC §3.3, §8.1~8.6, §9.4, §12 의 표를 한 줄씩 체크�
 
 ## 12. 산출물 체크리스트 (v0.1 태그 조건)
 
-- [ ] `SPEC.md` v0.1 확정(미결 M1, M2 결정 반영)
-- [ ] `fdt/engine/` 전 모듈, `fdt/gen/`, `fdt/eval/`, `fdt/tools/`, `cli.py`
-- [ ] `schemas/*.schema.json` 내보내기
-- [ ] `data/seed/` 4 프로필, `tests/golden/` 20개
-- [ ] `pytest -q` 통과, 커버리지 ≥ 85%
-- [ ] `docs/EVAL_REPORT.md`, `docs/QA_REPORT.md`, `docs/reviews/` 3회 전체 리뷰
-- [ ] `README.md`: 설치, `gen → build → run → validate → render` 5분 안내, 모드별 요청 예시 5개
+- [ ] `SPEC.md` v0.1 확정(미결 M1, M2 결정 반영): M2 결정 반영(S66), M1·M3(신설, N5) 은 아직 미결(SPEC 은 v0.6 진행 중)
+- [ ] `fdt/engine/` 전 모듈, `fdt/gen/`, `fdt/eval/`, `fdt/tools/`, `cli.py`: `engine/`, `gen/`, `tools/`, `cli.py` 완료(W0~W12), `eval/` 은 진행 중(W14)
+- [x] `schemas/*.schema.json` 내보내기 (W0 완료)
+- [ ] `data/seed/` 4 프로필, `tests/golden/` 20개: seed 4 프로필 완료, 골든 스냅샷 20개는 미완료(W13, 골든 제외)
+- [ ] `pytest -q` 통과, 커버리지 ≥ 85% (미확정, 골든 미완료로 W13 진행 중)
+- [ ] `docs/EVAL_REPORT.md`, `docs/QA_REPORT.md`, `docs/reviews/` 3회 전체 리뷰: 리뷰 문서 4건 기록됨(`20260907_W0`, `_W1_W2`, `_W3_W4_W5`, `_W6_W10`), `EVAL_REPORT.md`/`QA_REPORT.md` 는 미작성(W14~W15)
+- [ ] `README.md`: 설치, `gen → build → run → validate → render` 5분 안내, 모드별 요청 예시 5개 (W15 미착수)

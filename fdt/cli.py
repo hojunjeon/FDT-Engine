@@ -23,6 +23,11 @@ from fdt.engine.errors import E_REQ_INVALID, E_REQ_RANGE, FdtError, extract_erro
 from fdt.engine.schemas.input import TwinInput
 from fdt.engine.schemas.request import ModeRequest
 from fdt.engine.taxonomy import ENVELOPE_IDS
+from fdt.eval.backtest import run_backtest
+from fdt.eval.calibration import run_calibration
+from fdt.eval.monotonic import run_monotonic
+from fdt.eval.perf import run_perf
+from fdt.eval.report import write_json_reports, write_markdown_report
 from fdt.gen import DEFAULT_END, DEFAULT_MONTHS, PROFILE_NAMES, write_profile
 from fdt.tools.engine_io import load_engine, save_engine
 from fdt.tools.render import render_result
@@ -30,6 +35,8 @@ from fdt.tools.schema_export import export_json_schemas
 from fdt.tools.validate import validate_result
 
 app = typer.Typer(help="FDT 엔진 테스트용 CLI")
+eval_app = typer.Typer(help="평가 도구 (SPEC 12장, PLAN §3 Phase 7)")
+app.add_typer(eval_app, name="eval")
 
 _ENVELOPE_NAME_BY_ID: dict[int, str] = {idx: name for name, idx in ENVELOPE_IDS.items()}
 
@@ -439,6 +446,109 @@ def render(
         for path in written:
             typer.echo(f"wrote {path}")
         typer.echo(f"{len(written)} PNG file(s) written to {out}")
+
+
+def _parse_seeds(seeds: str) -> list[int]:
+    return [int(s.strip()) for s in seeds.split(",") if s.strip()]
+
+
+_DEFAULT_SEEDS = "1,3,5,7,11"
+
+
+@eval_app.command("backtest")
+def eval_backtest(
+    seeds: str = typer.Option(_DEFAULT_SEEDS, "--seeds", help="쉼표로 구분한 데이터 시드 목록"),
+    n_paths: int = typer.Option(1000, "--n-paths", help="시뮬레이션 경로 수"),
+    out: Path = typer.Option(Path("data/eval"), "--out", help="출력 디렉터리"),  # noqa: B008
+) -> None:
+    """홀드아웃 백테스트(SPEC §12 sMAPE·커버리지)를 돌려 `data/eval/backtest.json` 을 쓴다."""
+
+    with _cli_error_guard():
+        report = run_backtest(list(PROFILE_NAMES), _parse_seeds(seeds), n_paths=n_paths)
+        written = write_json_reports(out, backtest=report)
+        for path in written:
+            typer.echo(f"wrote {path}")
+
+
+@eval_app.command("calibration")
+def eval_calibration(
+    seeds: str = typer.Option("1,2,3,4,5", "--seeds", help="쉼표로 구분한 데이터 시드 목록"),
+    n_paths: int = typer.Option(1000, "--n-paths", help="시뮬레이션 경로 수"),
+    out: Path = typer.Option(Path("data/eval"), "--out", help="출력 디렉터리"),  # noqa: B008
+) -> None:
+    """리스크 캘리브레이션(ECE·Brier)을 돌려 `data/eval/calibration.json` 을 쓴다."""
+
+    with _cli_error_guard():
+        report = run_calibration(list(PROFILE_NAMES), _parse_seeds(seeds), n_paths=n_paths)
+        written = write_json_reports(out, calibration=report)
+        for path in written:
+            typer.echo(f"wrote {path}")
+
+
+@eval_app.command("monotonic")
+def eval_monotonic(
+    n_paths: int = typer.Option(1000, "--n-paths", help="시뮬레이션 경로 수"),
+    out: Path = typer.Option(Path("data/eval"), "--out", help="출력 디렉터리"),  # noqa: B008
+) -> None:
+    """WHATIF 단조성 위반 수를 세어 `data/eval/monotonic.json` 을 쓴다."""
+
+    with _cli_error_guard():
+        report = run_monotonic(list(PROFILE_NAMES), n_paths=n_paths)
+        written = write_json_reports(out, monotonic=report)
+        for path in written:
+            typer.echo(f"wrote {path}")
+
+
+@eval_app.command("perf")
+def eval_perf(
+    n_paths: int = typer.Option(1000, "--n-paths", help="시뮬레이션 경로 수"),
+    out: Path = typer.Option(Path("data/eval"), "--out", help="출력 디렉터리"),  # noqa: B008
+) -> None:
+    """SPEC §12 성능 5 항목 + 재현성을 측정해 `data/eval/perf.json` 을 쓴다."""
+
+    with _cli_error_guard():
+        report = run_perf(n_paths=n_paths)
+        written = write_json_reports(out, perf=report)
+        for path in written:
+            typer.echo(f"wrote {path}")
+
+
+@eval_app.command("all")
+def eval_all(
+    seeds: str = typer.Option(_DEFAULT_SEEDS, "--seeds", help="쉼표로 구분한 데이터 시드 목록"),
+    n_paths: int = typer.Option(1000, "--n-paths", help="시뮬레이션 경로 수"),
+    out: Path = typer.Option(Path("data/eval"), "--out", help="출력 디렉터리"),  # noqa: B008
+) -> None:
+    """백테스트·캘리브레이션·단조성·성능을 전부 돌려 `docs/EVAL_REPORT.md` 를 쓴다."""
+
+    with _cli_error_guard():
+        seed_list = _parse_seeds(seeds)
+        profiles = list(PROFILE_NAMES)
+
+        typer.echo("running backtest...")
+        backtest = run_backtest(profiles, seed_list, n_paths=n_paths)
+        typer.echo("running calibration...")
+        calibration_seeds = [1, 2, 3, 4, 5]
+        calibration = run_calibration(profiles, calibration_seeds, n_paths=n_paths)
+        typer.echo("running monotonic...")
+        monotonic = run_monotonic(profiles, n_paths=n_paths)
+        typer.echo("running perf...")
+        perf = run_perf(n_paths=n_paths)
+
+        written = write_json_reports(
+            out, backtest=backtest, calibration=calibration, monotonic=monotonic, perf=perf
+        )
+        for path in written:
+            typer.echo(f"wrote {path}")
+
+        md_path = write_markdown_report(
+            Path("docs/EVAL_REPORT.md"),
+            backtest=backtest,
+            calibration=calibration,
+            monotonic=monotonic,
+            perf=perf,
+        )
+        typer.echo(f"wrote {md_path}")
 
 
 if __name__ == "__main__":

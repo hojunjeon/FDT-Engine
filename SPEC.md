@@ -1,6 +1,6 @@
-# FDT 엔진 명세 (SPEC) v0.5
+# FDT 엔진 명세 (SPEC) v0.6
 
-- 상태: v0.5 (2026-09-07, W6~W10 리뷰 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
+- 상태: v0.6 (2026-09-07, S48 앞당김 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
 - 범위: **엔진만**. 자연어 라우팅(에이전트), 코칭 문장 생성, 대시보드, 이체 실행은 전부 범위 밖이다.
 - 상위 문서: `../../00_특화PJT_기획/07_FINAL/01_KeyFin_기획의도.md`, `02_KeyFin_요구사항명세.md`, `FDT.md`, ERD `ERD_v1.1`(erdcloud RvbfSXjYXdjM8RdjK), 금융망 API 문서 `docs/금융_api/`.
 - 선행 구현: `../03_Finance-Digital-Twin` 의 트윈 코어 공식(설계서 §7)을 계승한다. 계승·변경 내역은 §13에 적는다.
@@ -340,7 +340,9 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
 ### 7.2 하루 처리 순서 (MUST, 생성기와 동일)
 
 ```
-1 수입      d == next_income → liquidity += expected × (1+income_growth)^(년). 불규칙이면 금액에 LogNormal(0, 0.4) 잡음, 다음일 = d + median_gap
+1 수입      d == next_income → liquidity += expected × (1+income_growth)^(년).
+            규칙적 수입(day-of-month 고정)은 다음일 = 정해진 날짜이며 난수를 소비하지 않는다(CRN 보존).
+            불규칙 수입은 금액 ~ LogNormal(0, 0.4) 잡음을 곱하고, 다음 수입일 = d + max(3, round(median_gap + N(0, 0.3·median_gap)))(S48. 생성기 §11 규칙과 동일해야 한다)
 2 고정비    큐 due == d, **단 kind == CARD_BILL 은 이 단계에서 처리하지 않는다**(S44. 청구·출금은 3~4단계가 `cards[]` 상태로 직접 진행한다. 큐의 CARD_BILL 은 §8.2 events 표시·§8.4 확정 유출에만 쓴다).
             계좌형: cash ≥ amount 면 차감, 부족하면 당일 거절 → unpaid_obligation 누적(재시도 없음). 카드형(카드 결제형 고정비): card.unbilled += amount
             kind == LOAN 이고 `EXTERNAL.loan_rate_delta_bp` 가 주입되어 있으면(§8.3) `repayment == INTEREST_ONLY` 인 항목만 `principal × (rate_pct+delta_bp/100)/100/12` 로 재계산한다(10원 단위, S64). `AMORTIZING` 은 재계산하지 않는다
@@ -668,6 +670,7 @@ fdt inspect --engine ...            # State/Behavior 요약 표 출력
 fdt render  --result out/A_risk.json --out out/A_risk/    # viz 명세 → PNG (개발용, matplotlib)
 fdt validate --result out/A_risk.json                      # 스키마 + facts/viz 정합 검사
 fdt schema  --out schemas/                                  # TwinInput/State/Behavior/ModeRequest/EngineResult JSON Schema 내보내기
+fdt eval    backtest|calibration|monotonic|perf|all          # §12 기준 자동 측정, data/eval/*.json + docs/EVAL_REPORT.md
 ```
 
 - 모드 선택은 `--mode` 필수. 라우팅 기능은 없다.
@@ -710,7 +713,9 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | 리스크 캘리브레이션 (23 사용자 × 7일 간격 as_of) | ECE ≤ 0.15, Brier < 기준율 Brier |
 | 단조성 | 지출 주입 증가 → 부족 확률 비감소, 최저 잔액 비증가 (전 프로필·as_of 표본) |
 
-**백테스트 예비 측정(2026-09-07, 5 시드, `docs/reviews/20260907_W6_W10.md`).** sMAPE A .018, B .094(기준 .25 이내 통과), **C .559(기준 .40 초과, 4/5 시드 초과, FAIL)**, D .022. 성능 12 항목은 전부 기준의 1/30 이하. C 실패 원인은 §7.2 5단계 현금 억제를 전부-또는-전무 판정으로 뒀던 것과 불규칙 수입 간격을 결정론으로 둔 것 두 가지로 특정했다(S46 이 전자를, S48 이연이 후자를 다룬다). **C 프로필 기준 재검토 메모(v0.2):** S46 반영 후 재측정해 sMAPE .40 기준을 다시 통과하는지 확인하고, 통과하지 못하면 C 의 기준치 자체(현재 .40)를 재조정할지 결정한다.
+평가 도구: `fdt eval backtest|calibration|monotonic|perf|all`, 산출물 `data/eval/*.json`, `docs/EVAL_REPORT.md`.
+
+**백테스트 예비 측정(2026-09-07, 5 시드, `docs/reviews/20260907_W6_W10.md`).** sMAPE A .018, B .094(기준 .25 이내 통과), **C .559(기준 .40 초과, 4/5 시드 초과, FAIL)**, D .022. 성능 12 항목은 전부 기준의 1/30 이하. C 실패 원인은 §7.2 5단계 현금 억제를 전부-또는-전무 판정으로 뒀던 것과 불규칙 수입 간격을 결정론으로 둔 것 두 가지로 특정했다(S46 이 전자를, S48 이 후자를 다룬다). **C 프로필 기준 재검토 메모:** S46·S48 반영 후 재측정해 sMAPE .40 기준을 다시 통과하는지 확인하고, 통과하지 못하면 C 의 기준치 자체(현재 .40)를 재조정할지 결정한다.
 
 ---
 
@@ -738,7 +743,7 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | R2 | 카드 할부 API 부재(요구사항 미결 #6) | `loans[AMORTIZING]` 으로 재현. 할부 개념은 엔진에 두지 않음 |
 | R3 | 봉투 주기가 달력 월인데 급여일이 다름 | v0.1 달력 월 고정. `cycle_anchor: PAYDAY` 옵션은 v0.2 |
 | R4 | OPTIMIZE 후보 폭발 | 시뮬 ≤ 40회, n_paths 자동 하향, 결과에 `evaluated/sim_calls` 명시 |
-| R5 | 불규칙 수입 예측 오차 | 기준 완화(C). v0.2 에 수입 간격 분포 샘플링(S48 이연). 정량 근거: C 프로필 커버리지가 5 시드 중 4회 0.6 이하로 나온다(원인은 §7.2 1단계 간격 잡음을 결정론(`median_gap` 고정)으로 둔 것이며, 생성기와 같은 잡음 `d + max(3, round(median_gap + N(0, 0.3·median_gap)))` 을 v0.2 에서 시뮬레이터에도 반영한다) |
+| R5 | 불규칙 수입 예측 오차 | S48 적용(v0.1, v0.6). §7.2 1단계에 생성기와 동일한 간격 잡음 `d + max(3, round(median_gap + N(0, 0.3·median_gap)))` 을 시뮬레이터에도 반영했다(이전엔 결정론 `median_gap` 고정이었다). 정량 근거: C 프로필 커버리지가 5 시드 중 4회 0.6 이하로 나왔던 원인. 재측정으로 기준(§12) 재검증 필요 |
 | R6 | `is_variable` 고정비 금액 추정 실패 | 원장 중앙값 없으면 0 + 경고. facts 에 `unknown_variable_fixed` 노출 |
 | R7 | facts 와 viz 라벨 불일치 | `fdt validate` 가 annotations·caption 의 숫자를 facts 집합과 대조 |
 | R8 | 생성기·시뮬레이터 규칙 발산 | §7.2 를 정본으로 삼는다. 두 코드가 공유 상수 모듈을 쓰게 하고, §15.A 표를 두 코드 공통 테스트로 고정한다 |
@@ -746,6 +751,7 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | R10 | Behavior 추정 표본 오차(90일 창)가 A·D 커버리지 이탈과 D GOAL `achieve_prob` 분산의 직접 원인 | S49 이연. 정량 근거: 90일 창에서 봉투별 건수 추정이 시드에 따라 ±26% 흩어져 30일 누적 소비가 0.74~1.10배로 갈리고, 이것이 A·D 커버리지 이탈과 D GOAL `achieve_prob` 0.006~0.983 분산의 직접 원인이다. v0.2 에 추정 창 확대(가용 이력 전체, 상한 180일) 또는 표준오차 노출 |
 | M1 | 확률 표기를 % 정수로 할지 소수로 할지 | 모드 내 통일만 강제. 에이전트 팀과 합의 후 고정 |
 | M2 | GOAL `SAVE` 타입의 "저축" 정의(비상금 이체 포함 여부) | v0.1: PRIMARY 잔액 증가분(economic 기준, S66)으로 정의 |
+| M3 | A 프로필이 `level: SAFE` 인데 `alerts` 에 `ACCELERATION` `WARNING` 이 동반될 수 있다(§8.5.2 가속도 판정과 §8.5 전체 `level` 산식이 서로 다른 신호를 본다). 현재 `Alert` 스키마에 이 불일치를 표시할 참고 필드가 없어 소비자가 모순으로 오해할 수 있다 | 미결(N5). Alert 에 `context`/`note` 같은 참고 표시 필드 추가 여부를 다음 리뷰에서 결정 |
 
 ---
 
@@ -880,3 +886,9 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | S65 | §7.1 `Overrides` 필드 목록 명시: `budgets`, `hard_caps`, `cancel_committed(source_fixed_expense_id)`, `committed_amount_override(키 "kind:source_id")`, `externals`, `card_withdrawal_weekday` |
 | S66 | §8.2/§8.3/§8.5 `SpendInjection.card_id?` 로 카드 지정(없으면 첫 관리 카드). §8.4 GOAL SAVE 지표를 economic 기준(카드 미결제 차감)으로 명시하고 확정 유출에서 큐 CARD_BILL 은 카드 상태 기반 값으로 1회만 계상(S44 연계). §8.6 `OptimizeResult` 에 `notes[]`, `n_paths_used` 추가 |
 | 추가1 | §12 성능·품질 표에 "백테스트 예비 측정(2026-09-07, 5 시드)" 결과 요약(A .018, B .094, C .559 FAIL, D .022)과 C 프로필 기준 재검토 메모(v0.2) 추가 |
+
+`docs/reviews/20260907_W6_W10.md` 후속 오케스트레이터 결정 반영 내역 (v0.5 → v0.6).
+
+| # | 요약 |
+| --- | --- |
+| S48 적용(v0.6) | S48 을 v0.2 이연에서 v0.1 로 앞당김. §7.2 1단계에 "불규칙 수입의 다음 수입일 = d + max(3, round(median_gap + N(0, 0.3·median_gap))), 금액 LogNormal(0, 0.4). 규칙적 수입은 난수를 소비하지 않는다(CRN)" 명시. §14 R5 를 "이연"에서 "적용"으로 갱신. 생성기 §11 규칙과 동일해야 함을 명시 |

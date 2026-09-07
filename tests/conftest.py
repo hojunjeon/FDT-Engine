@@ -18,6 +18,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SEED_DATA_ROOT = _REPO_ROOT / "data" / "seed"
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """`slow` 마커 등록(PLAN §5.2, W13) - 표본이 큰 속성 테스트를 선택적으로
+    스킵할 수 있게 한다(`pytest -m "not slow"`)."""
+
+    config.addinivalue_line("markers", "slow: 실행 시간이 긴 테스트(속성 테스트 등)")
+
+
 @pytest.fixture(scope="session")
 def profiles_3m() -> dict[str, tuple[TwinInput, dict[str, Any]]]:
     """4 프로필(A/B/C/D) x seed=7, months=3 의 (TwinInput, ground_truth).
@@ -42,11 +49,32 @@ def engines_3m(
     return {name: build_engine(twin) for name, (twin, _gt) in profiles_3m.items()}
 
 
-def _load_seed_engine(profile_name: str) -> Engine:
+def _load_seed_twin(profile_name: str) -> TwinInput:
     twin_input_path = _SEED_DATA_ROOT / f"{profile_name}_{_SEED}" / "twin_input.json"
     raw = twin_input_path.read_text(encoding="utf-8")
-    twin = TwinInput.model_validate_json(raw)
-    return build_engine(twin)
+    return TwinInput.model_validate_json(raw)
+
+
+def _load_seed_engine(profile_name: str) -> Engine:
+    return build_engine(_load_seed_twin(profile_name))
+
+
+@pytest.fixture(scope="session")
+def twins_6m() -> dict[str, TwinInput]:
+    """`data/seed/<profile>_7/twin_input.json`(6개월) 의 `TwinInput` 원본 4종.
+
+    `seed_engine_A/B/C/D` 는 기본 `as_of`(=twin.as_of) 로 빌드한 `Engine`
+    하나만 주므로, 여러 `as_of` 표본으로 다시 빌드해야 하는 속성 테스트
+    (`tests/property/test_invariants.py`, PLAN §5.2)는 원본 `TwinInput` 이
+    필요하다(W13 소유, `tests/conftest.py` fixture 추가만 허용).
+    """
+
+    return {
+        "A_steady": _load_seed_twin("A_steady"),
+        "B_card_crunch": _load_seed_twin("B_card_crunch"),
+        "C_impulsive": _load_seed_twin("C_impulsive"),
+        "D_goal_saver": _load_seed_twin("D_goal_saver"),
+    }
 
 
 @pytest.fixture(scope="session")

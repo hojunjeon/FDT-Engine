@@ -72,7 +72,6 @@ import 하는 계약): `simulate`, `Overrides`, `SimulationResult`.
 
 from __future__ import annotations
 
-import calendar
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -80,6 +79,7 @@ from typing import Any
 
 import numpy as np
 
+from fdt.engine._dateutil import add_months, clamped_month_date
 from fdt.engine.schemas.behavior import Behavior
 from fdt.engine.schemas.input import Externals
 from fdt.engine.schemas.request import Injection
@@ -95,21 +95,17 @@ _YEAR_DAYS = 365.25
 
 
 # ---------------------------------------------------------------------------
-# 날짜 헬퍼 (state.py 의 동명 private 헬퍼와 의도적으로 별개 구현 - 모듈 간
-# private 심볼 의존을 피한다. 아주 작은 순수 날짜 계산이라 "생성기 코드
-# 복사" 금지와는 무관하다)
+# 날짜 헬퍼 (리뷰 N10: `_clamped_month_date`/`_add_month` 사본을 공용
+# `fdt/engine/_dateutil.py`(J2) 로 교체했다. `_next_month` 만 이 모듈에 남긴다
+# - `add_months(d, n)` 는 `d.day` 를 앵커로 쓰므로, "day_of_month 를 고정하고
+# 월만 넘긴다" 패턴에는 매번 day=1 인 날짜로 호출해야 앵커 일자 드리프트가
+# 없다(1일은 모든 달에 유효해 클램프가 절대 일어나지 않는다).)
 # ---------------------------------------------------------------------------
 
 
-def _clamped_month_date(year: int, month: int, day: int) -> date:
-    last_day = calendar.monthrange(year, month)[1]
-    return date(year, month, min(day, last_day))
-
-
-def _add_month(year: int, month: int) -> tuple[int, int]:
-    if month == 12:
-        return year + 1, 1
-    return year, month + 1
+def _next_month(year: int, month: int) -> tuple[int, int]:
+    nxt = add_months(date(year, month, 1), 1)
+    return nxt.year, nxt.month
 
 
 def _first_weekday_on_or_after(d: date, weekday: int) -> date:
@@ -138,15 +134,15 @@ def _expand_recurring_dates(inj: Any, as_of: date, horizon_end: date) -> list[da
 
     day_of_month = inj.day_of_month
     year, month = inj.start.year, inj.start.month
-    candidate = _clamped_month_date(year, month, day_of_month)
+    candidate = clamped_month_date(year, month, day_of_month)
     if candidate < inj.start:
-        year, month = _add_month(year, month)
-        candidate = _clamped_month_date(year, month, day_of_month)
+        year, month = _next_month(year, month)
+        candidate = clamped_month_date(year, month, day_of_month)
     while candidate <= until:
         if as_of < candidate <= horizon_end:
             out.append(candidate)
-        year, month = _add_month(year, month)
-        candidate = _clamped_month_date(year, month, day_of_month)
+        year, month = _next_month(year, month)
+        candidate = clamped_month_date(year, month, day_of_month)
     return out
 
 
@@ -461,12 +457,40 @@ def simulate(
     spent_init = np.array([state_env_by_id[e].spent for e in env_ids], dtype=np.int64)
 
     # -- 수입 일정 (SPEC 5.1 income, 6장 payday_boost/pre_payday_damp) ---
+    # S48(리뷰 U1): 불규칙 수입은 다음 입금일 자체가 경로마다 흔들려야 한다
+    # (생성기 `fdt/gen/generator.py:_step_income` 의
+    # `actual_gap = max(3, round(gap + N(0, 0.3*gap)))` 와 동일 분포). 이전
+    # 버전은 `next = d + median_gap_days` 로 전 경로가 같은 날 입금돼(결정론)
+    # C 프로필 커버리지가 좁아지는 정량적 원인이었다(리뷰 항목 2, U1). 규칙적
+    # 수입(SALARY)은 날짜가 이미 결정론이라 잡음도, 난수 소비도 없다(CRN
+    # 보존 - A/B/D 프로필은 이 블록에서 `rng_main` 을 전혀 건드리지 않는다).
     income = state.income
     income_anchor_day = income.next_date.day if income.next_date is not None else None
-    next_income_date = income.next_date
+    # `irregular_income`: `income.irregular` 이고 다음 입금일이 실제로 잡혀
+    # 있을 때만 경로별 배열을 쓴다. behavior.py 는 `irregular=True` 이면서
+    # `next_date` 가 있으면 `median_gap_days` 도 항상 채운다(1건 이하일 때만
+    # `next_date=None` 이 되므로) - 그래도 방어적으로 둘 다 확인한다.
+    irregular_income = (
+        income.irregular and income.next_date is not None and income.median_gap_days is not None
+    )
+
+    next_income_date: date | None = None
     last_income_date: date | None = None
-    if income.next_date is not None and income.median_gap_days is not None:
-        last_income_date = income.next_date - timedelta(days=income.median_gap_days)
+    next_income_ord: np.ndarray | None = None
+    last_income_ord: np.ndarray | None = None
+
+    if irregular_income:
+        assert income.next_date is not None and income.median_gap_days is not None
+        next_income_ord = np.full(n_paths, income.next_date.toordinal(), dtype=np.int64)
+        last_income_ord = np.full(
+            n_paths,
+            (income.next_date - timedelta(days=income.median_gap_days)).toordinal(),
+            dtype=np.int64,
+        )
+    else:
+        next_income_date = income.next_date
+        if income.next_date is not None and income.median_gap_days is not None:
+            last_income_date = income.next_date - timedelta(days=income.median_gap_days)
 
     payday_boost = behavior.payday_boost
     pre_payday_damp = behavior.pre_payday_damp
@@ -566,15 +590,41 @@ def simulate(
             injected_spent[:, :] = 0
 
         # 1. 수입 -------------------------------------------------------
-        if next_income_date is not None and d == next_income_date:
+        if irregular_income:
+            # S48/U1: 경로별로 다음 입금일이 흔들리므로, 오늘 입금일이 된
+            # 경로만 골라(`due_mask`) 금액·다음 입금일을 갱신한다. 규칙적
+            # 수입과 달리 이 분기는 `rng_main` 을 두 번 더 소비한다(금액
+            # 잡음 + 간격 잡음) - 그래서 규칙적 프로필의 CRN 은 이 분기를
+            # 절대 타지 않는다(위 `irregular_income` 분리 참조).
+            assert next_income_ord is not None and last_income_ord is not None
+            due_mask = next_income_ord == d_ord
+            if due_mask.any():
+                years_elapsed = (d - as_of).days / _YEAR_DAYS
+                growth_mult = (1.0 + income_growth_pct) ** years_elapsed
+                n_due = int(due_mask.sum())
+                noise = rng_main.lognormal(mean=0.0, sigma=0.4, size=n_due)
+                amounts = np.round(income.expected * growth_mult * noise).astype(np.int64)
+                liquidity[due_mask] += amounts
+                last_income_ord[due_mask] = d_ord
+                day_events.append(
+                    Event(
+                        kind="INCOME",
+                        name="수입",
+                        amount=round(float(np.median(amounts))),
+                        success_ratio=1.0,
+                    )
+                )
+                # 생성기와 동일 분포: actual_gap = max(3, round(gap + N(0, 0.3*gap)))
+                gap = income.median_gap_days
+                assert gap is not None  # irregular_income 조건이 이미 보장
+                gap_noise = rng_main.normal(0.0, gap * 0.3, size=n_due)
+                actual_gap = np.maximum(3, np.round(gap + gap_noise).astype(np.int64))
+                next_income_ord[due_mask] = d_ord + actual_gap
+        elif next_income_date is not None and d == next_income_date:
             years_elapsed = (d - as_of).days / _YEAR_DAYS
             growth_mult = (1.0 + income_growth_pct) ** years_elapsed
-            if income.irregular:
-                noise = rng_main.lognormal(mean=0.0, sigma=0.4, size=n_paths)
-                amount_paths = np.round(income.expected * growth_mult * noise).astype(np.int64)
-            else:
-                scalar_amount = round(income.expected * growth_mult)
-                amount_paths = np.full(n_paths, scalar_amount, dtype=np.int64)
+            scalar_amount = round(income.expected * growth_mult)
+            amount_paths = np.full(n_paths, scalar_amount, dtype=np.int64)
             liquidity += amount_paths
             last_income_date = d
             day_events.append(
@@ -585,11 +635,9 @@ def simulate(
                     success_ratio=1.0,
                 )
             )
-            if income.irregular and income.median_gap_days is not None:
-                next_income_date = d + timedelta(days=income.median_gap_days)
-            elif income_anchor_day is not None:
-                y, m = _add_month(d.year, d.month)
-                next_income_date = _clamped_month_date(y, m, income_anchor_day)
+            if income_anchor_day is not None:
+                y, m = _next_month(d.year, d.month)
+                next_income_date = clamped_month_date(y, m, income_anchor_day)
             else:
                 next_income_date = None
 
@@ -737,11 +785,25 @@ def simulate(
 
         # 5. 소비 --------------------------------------------------------
         weekday = d.weekday()
-        boost = 1.0
-        if last_income_date is not None and 0 <= (d - last_income_date).days <= 6:
-            boost *= payday_boost
-        if next_income_date is not None and 1 <= (next_income_date - d).days <= 5:
-            boost *= pre_payday_damp
+        boost: float | np.ndarray
+        if irregular_income:
+            # S48: 입금일이 경로별로 갈라지므로 payday_boost/pre_payday_damp
+            # 창도 경로별 배열이 된다(생성기와 달리 벡터화 시뮬레이터라서
+            # "이 경로는 지금 payday 창 안" 을 불리언 마스크로 표현한다).
+            assert next_income_ord is not None and last_income_ord is not None
+            boost = np.ones(n_paths, dtype=np.float64)
+            since_last = d_ord - last_income_ord
+            payday_mask = (since_last >= 0) & (since_last <= 6)
+            boost = np.where(payday_mask, payday_boost, boost)
+            until_next = next_income_ord - d_ord
+            pre_mask = (until_next >= 1) & (until_next <= 5)
+            boost = np.where(pre_mask, boost * pre_payday_damp, boost)
+        else:
+            boost = 1.0
+            if last_income_date is not None and 0 <= (d - last_income_date).days <= 6:
+                boost *= payday_boost
+            if next_income_date is not None and 1 <= (next_income_date - d).days <= 5:
+                boost *= pre_payday_damp
 
         # B3: elasticity_gate 문턱은 `gate_budget_arr`(behavior_follows 예산)
         # 로 계산한다 - 실제 봉투 예산(`budget_arr`, exhaustion/출력용)과
