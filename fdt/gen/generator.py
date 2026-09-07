@@ -431,17 +431,19 @@ class Generator:
         emergency_amt = int(self.profile["hidden"]["emergency_transfer_monthly"])
         if emergency_amt > 0 and self._emergency_id is not None:
             emer = self.accounts[self._emergency_id]
-            acc.balance -= emergency_amt
-            emer.balance += emergency_amt
-            self._add_tx(
-                tx_type="TRANSFER",
-                tx_date=d,
-                amount=emergency_amt,
-                account_id=self.primary_id,
-                counterparty_account_id=self._emergency_id,
-                merchant_name_raw="비상금이체",
-                exclude_tag="SELF_TRANSFER",
-            )
+            if acc.balance >= emergency_amt:
+                acc.balance -= emergency_amt
+                emer.balance += emergency_amt
+                self._add_tx(
+                    tx_type="TRANSFER",
+                    tx_date=d,
+                    amount=emergency_amt,
+                    account_id=self.primary_id,
+                    counterparty_account_id=self._emergency_id,
+                    merchant_name_raw="비상금이체",
+                    exclude_tag="SELF_TRANSFER",
+                )
+            # 부족하면 당일 건너뛴다(재시도 없음, SPEC §7.2 2단계 / S62)
 
     def _step_fixed(self, d: date) -> None:
         for fx in self.profile["fixed_expenses"]:

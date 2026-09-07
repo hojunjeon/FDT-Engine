@@ -83,6 +83,12 @@ def _krw_renderings(value: int | float, *, signed: bool = False) -> list[str]:
     0 -> ["0원"]. 음수는 "-"(ASCII 하이픈) 로 표시하고 "부족 X원" 표기를
     추가한다. 100만 미만이고 만원 단위 나머지가 있으면 "X.Y만원" 소수 표기도
     추가한다.
+
+    N15/S60: 1,000원 미만은 잔돈이라 "만원" 단위 축약·"약 …" 표기가 전부
+    무의미해진다(반올림하면 0이 되기 때문 - "0만원"은 한국어로 성립하지
+    않는다). 그런 값은 원 단위 표기 하나만 낸다. 1,000원 이상이어도 만원
+    단위로 반올림한 결과가 0이면(예: 1,400원 -> 약 0원) 그 "약 …" 표기는
+    만들지 않는다.
     """
 
     iv = round(value)
@@ -91,9 +97,12 @@ def _krw_renderings(value: int | float, *, signed: bool = False) -> list[str]:
 
     sign = "-" if iv < 0 else ""
     av = abs(iv)
+    plus = "+" if (signed and iv > 0) else ""
+
+    if av < 1000:
+        return [f"{plus}{sign}{av:,}원"]
 
     out: list[str] = []
-    plus = "+" if (signed and iv > 0) else ""
     out.append(f"{plus}{sign}{av:,}원")
     out.append(f"{plus}{sign}{_won_text(av)}원")
 
@@ -103,8 +112,9 @@ def _krw_renderings(value: int | float, *, signed: bool = False) -> list[str]:
         out.append(f"{plus}{sign}{decimal:g}만원")
 
     rounded_units = round(av / _MAN)
-    rounded = rounded_units * _MAN
-    out.append(f"약 {plus}{sign}{_won_text(rounded)}원")
+    if rounded_units > 0:
+        rounded = rounded_units * _MAN
+        out.append(f"약 {plus}{sign}{_won_text(rounded)}원")
 
     if iv < 0:
         out.append(f"부족 {av:,}원")
@@ -338,7 +348,9 @@ def _bool_fact(
 # ---------------------------------------------------------------------------
 
 
-def _facts_forecast(result: ForecastResult, as_of: date) -> list[Fact]:
+def _facts_forecast(
+    result: ForecastResult, as_of: date, horizon_days: int | None = None
+) -> list[Fact]:
     facts: list[Fact] = [
         _krw_fact(
             "end_balance_median", "말일 예상 잔액(중앙값)", result.end_point.median_balance, 1
@@ -404,7 +416,9 @@ def _facts_forecast(result: ForecastResult, as_of: date) -> list[Fact]:
     return facts
 
 
-def _facts_whatif(result: WhatIfResult, as_of: date) -> list[Fact]:
+def _facts_whatif(
+    result: WhatIfResult, as_of: date, horizon_days: int | None = None
+) -> list[Fact]:
     facts: list[Fact] = [
         _krw_fact("delta_min_balance", "최저 잔액 변화", result.delta.min_balance, 1, signed=True),
         _pct_fact(
@@ -465,7 +479,9 @@ def _facts_whatif(result: WhatIfResult, as_of: date) -> list[Fact]:
     return facts
 
 
-def _facts_goal(result: GoalResult, as_of: date) -> list[Fact]:
+def _facts_goal(
+    result: GoalResult, as_of: date, horizon_days: int | None = None
+) -> list[Fact]:
     facts: list[Fact] = [
         _bool_fact("feasible", "목표 달성 가능", result.feasible, 1),
         _pct_fact("achieve_prob", "목표 달성 확률", result.achieve_prob, 1),
@@ -494,7 +510,9 @@ def _facts_goal(result: GoalResult, as_of: date) -> list[Fact]:
     return facts
 
 
-def _facts_risk(result: RiskResult, as_of: date) -> list[Fact]:
+def _facts_risk(
+    result: RiskResult, as_of: date, horizon_days: int | None = None
+) -> list[Fact]:
     facts: list[Fact] = [
         _score_fact("risk_score", "위험 점수", result.risk_score, 1, hint=f"level={result.level}"),
         _text_fact("level", "위험 단계", result.level, 1),
@@ -508,6 +526,22 @@ def _facts_risk(result: RiskResult, as_of: date) -> list[Fact]:
         ),
         _text_fact("health_level", "재무 건강 단계", result.health.level, 3),
     ]
+
+    # S58: RISK gauge 제목이 요청한 기간("{horizon_days}일 결제 부족
+    # 위험")을 그대로 쓰므로, 그 숫자를 facts 로도 등록해야 §9.3 R7 검사를
+    # 통과한다(제목에 쓰는 숫자도 facts 표기 집합 안에 있어야 한다).
+    if horizon_days is not None:
+        facts.append(
+            Fact(
+                key="horizon_days",
+                label="예측 기간",
+                value=horizon_days,
+                unit="일",
+                precision=0,
+                allowed_renderings=[str(horizon_days), f"{horizon_days}일"],
+                importance=3,
+            )
+        )
 
     payment_risks_sorted = sorted(result.payment_risks, key=lambda p: -p.fail_prob)
     for i, pr in enumerate(payment_risks_sorted[:3], start=1):
@@ -530,16 +564,55 @@ def _facts_risk(result: RiskResult, as_of: date) -> list[Fact]:
     return facts
 
 
-def _facts_optimize(result: OptimizeResult, as_of: date) -> list[Fact]:
+def _joined_action_label(actions: list[Any], rank: int) -> str:
+    """조합 후보(2개 이상 행동)의 라벨을 이어붙인다 (B8).
+
+    `ra.actions[0].label` 만 읽으면 2 행동 조합이 1위와 같은 라벨로 표시되는
+    결함이 있었다 - `effect.cost_of_action` 이 이미 하던 대로 `"; ".join`
+    으로 모든 행동의 라벨을 잇는다.
+    """
+
+    labels = [a.label for a in actions if a.label]
+    if labels:
+        return "; ".join(labels)
+    return f"행동 {rank}위"
+
+
+def _facts_optimize(
+    result: OptimizeResult, as_of: date, horizon_days: int | None = None
+) -> list[Fact]:
     facts: list[Fact] = [
         _pct_fact("baseline_shortfall_prob", "기준 부족 확률", result.baseline.shortfall_prob, 1),
     ]
 
+    # B8 부산물: `ranked_bars.data.items.label` 에 찍히는 예산 축소 비율
+    # 숫자(10/20/30%)는 `AppliedAction.cut_ratio`(구조화 필드, 문자열 파싱
+    # 아님)에서 나온다 - facts 로 등록해 §9.3 R7 검사를 통과시킨다(항목
+    # 7-1 "3종(10/20/30)" 결함).
+    cut_ratio_pcts = sorted(
+        {
+            round(a.cut_ratio * 100)
+            for ra in result.ranked
+            for a in ra.actions
+            if a.cut_ratio is not None
+        }
+    )
+    if cut_ratio_pcts:
+        facts.append(
+            Fact(
+                key="candidate_cut_ratios",
+                label="후보가 고려한 예산 축소 비율",
+                value=", ".join(f"{p}%" for p in cut_ratio_pcts),
+                unit="text",
+                precision=0,
+                allowed_renderings=[f"{p}%" for p in cut_ratio_pcts],
+                importance=3,
+            )
+        )
+
     if result.ranked:
         top = result.ranked[0]
-        label = (
-            top.actions[0].label if top.actions and top.actions[0].label else f"행동 {top.rank}위"
-        )
+        label = _joined_action_label(top.actions, top.rank)
         facts.append(_text_fact("top_action_label", "1위 행동", label, 1))
 
         delta_val = top.effect.get("delta")
@@ -563,11 +636,7 @@ def _facts_optimize(result: OptimizeResult, as_of: date) -> list[Fact]:
                 facts.append(_ratio_fact("top_action_delta", "1위 행동 효과", delta_val, 1))
 
         for i, ranked_action in enumerate(result.ranked[1:3], start=2):
-            r_label = (
-                ranked_action.actions[0].label
-                if ranked_action.actions and ranked_action.actions[0].label
-                else f"행동 {ranked_action.rank}위"
-            )
+            r_label = _joined_action_label(ranked_action.actions, ranked_action.rank)
             facts.append(_text_fact(f"rank{i}_action_label", f"{i}위 행동", r_label, 3))
 
     facts.append(_text_fact("evaluated", "평가한 후보 수", result.evaluated, 3))
@@ -576,7 +645,7 @@ def _facts_optimize(result: OptimizeResult, as_of: date) -> list[Fact]:
     return facts
 
 
-_MODE_BUILDERS: dict[Mode, Callable[[Any, date], list[Fact]]] = {
+_MODE_BUILDERS: dict[Mode, Callable[[Any, date, int | None], list[Fact]]] = {
     Mode.FORECAST: _facts_forecast,
     Mode.WHATIF: _facts_whatif,
     Mode.GOAL: _facts_goal,
@@ -585,13 +654,24 @@ _MODE_BUILDERS: dict[Mode, Callable[[Any, date], list[Fact]]] = {
 }
 
 
-def build_facts(mode: Mode, result: ResultUnion, *, as_of: date) -> list[Fact]:
-    """모드별 result -> facts 목록 (SPEC 9.2, 9.4). 값 재계산 없음."""
+def build_facts(
+    mode: Mode, result: ResultUnion, *, as_of: date, horizon_days: int | None = None
+) -> list[Fact]:
+    """모드별 result -> facts 목록 (SPEC 9.2, 9.4). 값 재계산 없음.
+
+    `horizon_days` 는 `build_viz` 와 같은 시그니처를 유지해 두 함수가 항상
+    같은 요청 컨텍스트를 받을 수 있게 하는 자리다(S58). RISK 는 gauge
+    제목에 `"{horizon_days}일 결제 부족 위험"` 처럼 이 값을 그대로 쓰므로
+    (`viz.py`), 그 숫자가 facts 표기 집합에도 있어야 §9.3 R7 검사를
+    통과한다 - `_facts_risk` 가 `horizon_days` fact 를 등록한다. 다른
+    모드는 이미 구체적인 날짜/기간을 결과에서 뽑아 쓰므로 받기만 하고
+    쓰지 않는다.
+    """
 
     builder = _MODE_BUILDERS.get(mode)
     if builder is None:
         raise ValueError(f"알 수 없는 모드: {mode!r}")
-    return builder(result, as_of)  # type: ignore[arg-type]
+    return builder(result, as_of, horizon_days)  # type: ignore[arg-type]
 
 
 __all__ = ["build_facts", "renderings_for"]

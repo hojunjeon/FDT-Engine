@@ -10,7 +10,8 @@ RISK 의 alerts/health 등)은 각 모드 파일이 직접 한다 - 여기서는
 
 공개 이름 (W8 WHATIF, W9 GOAL, W10 OPTIMIZE 가 그대로 import 하는 계약):
 `SimContext`, `make_context`, `run_sim`, `to_int`, `trajectory_from`,
-`point_stats`, `events_from`, `envelope_name`.
+`point_stats`, `events_from`, `envelope_name`, `level_from_probs`,
+`envelope_adherence_mask`.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
+
+import numpy as np
 
 from fdt.engine.schemas.behavior import Behavior
 from fdt.engine.schemas.input import Externals
@@ -31,14 +34,23 @@ from fdt.engine.taxonomy import ENVELOPE_IDS
 
 __all__ = [
     "SimContext",
+    "envelope_adherence_mask",
     "envelope_name",
     "events_from",
+    "level_from_probs",
     "make_context",
     "point_stats",
     "run_sim",
     "to_int",
     "trajectory_from",
 ]
+
+# RISK risk_score 등급 문턱(SPEC 8.5 "score = round(100 * max(card, 0.6 *
+# shortfall)), <20 SAFE, <50 WARNING") - `level_from_probs` 가 이 규칙을
+# 재사용한다(리뷰 S52: WHATIF `branch_level` 이 RISK 와 같은 등급 규칙을
+# 쓰되 `risk.py` 를 import 하지 않는다).
+_LEVEL_SAFE_MAX = 20
+_LEVEL_WARNING_MAX = 50
 
 _ENVELOPE_NAME_BY_ID: dict[int, str] = {idx: name for name, idx in ENVELOPE_IDS.items()}
 
@@ -175,6 +187,42 @@ def point_stats(stats: PathStats) -> tuple[PointStat, PointStat]:
         median_balance=to_int(stats.end_balance_median),
     )
     return min_point, end_point
+
+
+def level_from_probs(shortfall_prob: float, card_shortfall_prob: float) -> str:
+    """RISK 의 `risk_score`/`level` 등급 규칙 재사용 (SPEC 8.5): `score =
+    round(100 * max(card_shortfall_prob, 0.6 * shortfall_prob))`, `<20`
+    SAFE, `<50` WARNING, 그 외 DANGER. `risk.py` 를 import 하지 않고 이
+    규칙만 공용 헬퍼로 복제한다 - risk.py 의 같은 계산과 동일 소스가 아니라
+    같은 SPEC 문구를 각자 옮긴 것이다(goal.py `_ESSENTIAL_IDS` 와 같은
+    저장소 관례, risk.py:33 주석 참조).
+    """
+
+    score = round(100 * max(card_shortfall_prob, 0.6 * shortfall_prob))
+    if score < _LEVEL_SAFE_MAX:
+        return "SAFE"
+    if score < _LEVEL_WARNING_MAX:
+        return "WARNING"
+    return "DANGER"
+
+
+def envelope_adherence_mask(
+    sim: SimulationResult, budgets: dict[int, int], idx: int
+) -> np.ndarray:
+    """전 봉투 AND 마스크(경로 축) - `idx` 시점에 **모든** 봉투의 누적
+    지출이 각자 예산 이내인 경로만 True (SPEC 8.4 ENVELOPE_ADHERE "이번 달
+    전 봉투 예산 내"). 봉투별 잔여의 **합**으로 재면 한 봉투의 여유가 다른
+    봉투의 초과를 상쇄해 버리므로(리뷰 블로커 B5), 반드시 이 AND 방식을
+    써야 한다 - `optimize.py` 의 `REACH_GOAL(ENVELOPE_ADHERE)` 분기가 이미
+    이 규칙으로 구현돼 있다(공용화 대상, 이 함수가 그 구현을 GOAL 모드도
+    쓸 수 있게 뽑은 것).
+    """
+
+    n_paths = sim.envelope_spend.shape[0]
+    ok = np.ones(n_paths, dtype=bool)
+    for i, eid in enumerate(sim.envelope_ids):
+        ok &= sim.envelope_spend[:, i, idx] <= budgets.get(eid, 0)
+    return ok
 
 
 def events_from(sim: SimulationResult, *, as_of: date | None = None) -> list[EventForecast]:

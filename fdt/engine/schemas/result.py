@@ -400,6 +400,10 @@ class WhatIfResult(_Base):
     delta: WhatIfDelta
     verdict: Literal["OK", "CAUTION", "DANGER"]
     crn: bool = True
+    # J2 용: RISK 의 `health.level` 과 같은 3단 등급으로 branch 시나리오의
+    # 위험 수준을 분류한 값(§8.5.3 health 공식 재사용 여부는 J2 결정).
+    # 옵션이라 기존 WHATIF 호출자는 영향받지 않는다.
+    branch_level: Literal["SAFE", "WARNING", "DANGER"] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -508,17 +512,44 @@ class OptimizeBaseline(_Base):
     end_balance_median: float
 
 
-class AppliedAction(_Base):
-    """OPTIMIZE 후보 1건이 실제로 적용한 행동 (SPEC 8.6 `ranked[].actions[]`, S9).
+class OverrideSpec(_Base):
+    """`Overrides`(simulate.py, SPEC 7.1) 중 §8.6.1 네 번째 AUTO 후보(카드
+    출금 요일 변경)만 표현하는 값 객체 (S57).
 
-    7종 `Injection` 유니온을 그대로 감싸고, 예산 삭감 비율 등 부가 정보만
-    덧붙인다. `Injection` 서브타입은 `extra="forbid"` 라 `cut_ratio` 같은
-    필드를 직접 담을 수 없어 별도 래퍼로 정의했다.
+    `Injection` 유니온(7종)은 `simulate()` 의 일시적 `Overrides` 필드
+    (예: `card_withdrawal_weekday`)를 표현할 방법이 없어(N13) `AppliedAction`
+    이 `injection` 대신 담을 수 있는 두 번째 형태로 추가한다. 카드 여러 장을
+    동시에 바꾸는 후보는 카드마다 `AppliedAction` 하나씩(각각 이 타입)으로
+    나눠 표현한다 - `RankedAction.actions` 가 이미 리스트다.
     """
 
-    injection: Injection
+    type: Literal["CARD_WITHDRAWAL_WEEKDAY"] = "CARD_WITHDRAWAL_WEEKDAY"
+    card_id: int
+    weekday: int = Field(ge=0, le=6)
+
+
+class AppliedAction(_Base):
+    """OPTIMIZE 후보 1건이 실제로 적용한 행동 (SPEC 8.6 `ranked[].actions[]`,
+    S9/S57).
+
+    7종 `Injection` 유니온 또는 `OverrideSpec` 중 **정확히 하나**를 감싸고,
+    예산 삭감 비율 등 부가 정보만 덧붙인다. `Injection` 서브타입/`OverrideSpec`
+    은 `extra="forbid"` 라 `cut_ratio` 같은 필드를 직접 담을 수 없어 별도
+    래퍼로 정의했다.
+    """
+
+    injection: Injection | None = None
+    override: OverrideSpec | None = None
     cut_ratio: float | None = None
     label: str | None = None
+
+    @model_validator(mode="after")
+    def _check_exactly_one(self) -> AppliedAction:
+        if (self.injection is None) == (self.override is None):
+            raise ValueError(
+                "AppliedAction 은 injection 또는 override 중 정확히 하나가 필요하다 (S57)"
+            )
+        return self
 
 
 class RankedAction(_Base):
@@ -540,6 +571,13 @@ class OptimizeResult(_Base):
     recommended: Recommended | None = None
     evaluated: int
     sim_calls: int
+    # N11: 후보 0개 등 결과가 빈 이유를 사람이 읽는 문장으로 남긴다
+    # (`GoalResult.notes` 와 같은 관례).
+    notes: list[str] = Field(default_factory=list)
+    # N14: `EngineMeta.n_paths` 는 요청값을 그대로 싣는다(엔진 전역 계약) -
+    # OPTIMIZE 가 시뮬 예산 때문에 실제로 하향한 값은 여기 따로 싣는다
+    # (J4 가 `combined_effect["n_paths_used"]` 대신/추가로 이 필드를 쓴다).
+    n_paths_used: int
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +715,7 @@ __all__ = [
     "LineSeries",
     "OptimizeBaseline",
     "OptimizeResult",
+    "OverrideSpec",
     "PaymentRisk",
     "PointStat",
     "ProgressBarsData",

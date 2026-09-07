@@ -194,8 +194,12 @@ class Engine:
                     details={"mode": req.mode.value},
                 )
             result = runner(self, req)
-            facts = build_facts(req.mode, result, as_of=self.meta.as_of)
-            viz = build_viz(req.mode, result, facts, as_of=self.meta.as_of)
+            facts = build_facts(
+                req.mode, result, as_of=self.meta.as_of, horizon_days=req.horizon_days
+            )
+            viz = build_viz(
+                req.mode, result, facts, as_of=self.meta.as_of, horizon_days=req.horizon_days
+            )
         except FdtError as exc:
             status = "ERROR"
             error = ResultEngineError(code=exc.code, message=exc.message, details=exc.details)
@@ -225,12 +229,19 @@ class Engine:
             )
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
+        # N14: OPTIMIZE 는 시뮬 예산 때문에 요청값(req.n_paths)보다 실제
+        # n_paths 를 하향할 수 있다(`optimize.py` 의 자동 하향). 그 실제
+        # 사용값이 `result.n_paths_used` 에 있으면 그 값을 싣고, 없으면
+        # (다른 모드, 또는 아직 그 필드가 없는 구버전 result) 요청값을
+        # 그대로 쓴다(getattr 방어).
+        n_paths_used = getattr(result, "n_paths_used", None)
+        n_paths_meta = n_paths_used if isinstance(n_paths_used, int) else req.n_paths
         result_meta = ResultEngineMeta(
             engine_id=self.meta.engine_id,
             as_of=self.meta.as_of,
             mode=req.mode,
             seed=req.seed,
-            n_paths=req.n_paths,
+            n_paths=n_paths_meta,
             horizon_days=req.horizon_days,
             elapsed_ms=elapsed_ms,
             engine_version=self.meta.engine_version,

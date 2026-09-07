@@ -347,6 +347,37 @@ def test_run_returns_error_when_mode_runner_is_missing(monkeypatch, engines_3m):
     assert result.meta.mode.value == "FORECAST"
 
 
+def test_run_optimize_meta_n_paths_reflects_actual_used_value(engines_3m):
+    """N14 회귀: OPTIMIZE 는 시뮬 예산 때문에 요청한 n_paths(예: 5000)보다
+    실제로 적은 값(`OptimizeResult.n_paths_used`)을 쓸 수 있다 -
+    `EngineMeta.n_paths` 가 요청값을 그대로 싣지 않고 실제 사용값을
+    실어야 한다(이전에는 요청값 그대로였다 - `engine.py:233` 항목 N14)."""
+
+    from fdt.engine.schemas.result import OptimizeResult
+
+    engine = engines_3m["B_card_crunch"]
+    req = ModeRequest(
+        mode="OPTIMIZE", n_paths=5000, params={"objective": "MIN_SHORTFALL_PROB"}
+    )
+    result = engine.run(req)
+
+    assert result.status == "OK", result.error
+    assert isinstance(result.result, OptimizeResult)
+    assert result.meta.n_paths == result.result.n_paths_used
+
+
+def test_run_forecast_meta_n_paths_falls_back_to_requested_value(engines_3m):
+    """N14 방어: `n_paths_used` 가 없는 모드(FORECAST 등)는 여전히 요청값을
+    그대로 싣는다(getattr 방어 경로)."""
+
+    engine = engines_3m["A_steady"]
+    req = ModeRequest(mode="FORECAST", n_paths=321, params={})
+    result = engine.run(req)
+
+    assert result.status == "OK", result.error
+    assert result.meta.n_paths == 321
+
+
 def test_run_meta_warnings_are_typed_result_warnings(profiles_3m):
     """N16: `EngineMeta.warnings` 가 스키마 없는 `dict[str, Any]` 로 붕괴하지
     않고 `ResultWarning` 모델이어야 한다(`fdt validate`(W12)가 검사할 계약).

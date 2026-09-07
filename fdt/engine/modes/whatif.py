@@ -24,7 +24,13 @@ FORECAST 모드를 쓴다.
 from __future__ import annotations
 
 from fdt.engine.modes import register
-from fdt.engine.modes._common import make_context, point_stats, run_sim, to_int
+from fdt.engine.modes._common import (
+    level_from_probs,
+    make_context,
+    point_stats,
+    run_sim,
+    to_int,
+)
 from fdt.engine.schemas.request import ModeRequest, WhatIfParams
 from fdt.engine.schemas.result import (
     BranchSummary,
@@ -40,31 +46,41 @@ from fdt.engine.taxonomy import Mode
 
 __all__ = ["classify_verdict", "run_whatif"]
 
-# SPEC 8.3.1 판정 문턱.
-_DANGER_CARD_SHORTFALL_PROB = 0.5
+# SPEC 8.3.1 판정 문턱 (리뷰 S52 재정의: `verdict` 는 "주입의 효과"(델타)만
+# 본다 - 분기의 절대 위험은 `branch_level` 로 따로 낸다. 재정의 전 규칙(분기
+# `card_shortfall_prob >= 0.5` 또는 분기 최저 < 0 -> DANGER)은 기준선이 이미
+# 위험한 사용자(C 프로필)에게 0원 주입도 DANGER 를 답하게 만들어 WHATIF 를
+# 무의미하게 했다 - 리뷰 20260907_W6_W10.md §4c 실측.
 _CAUTION_DELTA_SHORTFALL_PROB = 0.15
 _CAUTION_MIN_RATIO = 0.5
+_DANGER_DELTA_CARD_SHORTFALL_PROB = 0.3
 
 
 def classify_verdict(
     *,
     base_min_balance: int,
     branch_min_balance: int,
-    branch_card_shortfall_prob: float,
+    delta_card_shortfall_prob: float,
     delta_shortfall_prob: float,
 ) -> str:
-    """SPEC 8.3.1 판정 규칙을 그대로 옮긴 순수 함수(값만 받아 계산 - 테스트가
-    경계값을 직접 넣어 검사할 수 있게 시뮬레이션과 분리해 둔다).
+    """WHATIF `verdict` 판정 - **델타(주입의 효과) 기준만** 본다(S52).
 
     ```
-    분기 card_shortfall_prob >= 0.5 또는 분기 최저 < 0            -> DANGER
+    delta.card_shortfall_prob >= 0.3 또는
+        (기준 최저 >= 0 이고 분기 최저 < 0, 즉 주입이 새로 마이너스를 만듦)
+                                                                   -> DANGER
     delta.shortfall_prob >= 0.15 또는
         (기준 최저 > 0 이고 분기 최저 < 기준 최저 * 0.5)          -> CAUTION
     그 외                                                          -> OK
     ```
+
+    분기 자체의 절대 위험(기준선이 이미 위험한지)은 이 함수가 answer 하지
+    않는다 - `level_from_probs` 로 계산해 `WhatIfResult.branch_level` 에
+    별도로 낸다.
     """
 
-    if branch_card_shortfall_prob >= _DANGER_CARD_SHORTFALL_PROB or branch_min_balance < 0:
+    danger_newly_negative = branch_min_balance < 0 and base_min_balance >= 0
+    if delta_card_shortfall_prob >= _DANGER_DELTA_CARD_SHORTFALL_PROB or danger_newly_negative:
         return "DANGER"
 
     caution_by_ratio = (
@@ -186,8 +202,11 @@ def run_whatif(engine, req: ModeRequest) -> WhatIfResult:
     verdict = classify_verdict(
         base_min_balance=base_min_balance,
         branch_min_balance=branch_min_balance,
-        branch_card_shortfall_prob=branch_stats.card_shortfall_prob,
+        delta_card_shortfall_prob=delta.card_shortfall_prob,
         delta_shortfall_prob=delta.shortfall_prob,
+    )
+    branch_level = level_from_probs(
+        branch_stats.shortfall_prob, branch_stats.card_shortfall_prob
     )
 
     return WhatIfResult(
@@ -195,5 +214,6 @@ def run_whatif(engine, req: ModeRequest) -> WhatIfResult:
         branch=branch_summary,
         delta=delta,
         verdict=verdict,  # type: ignore[arg-type]
+        branch_level=branch_level,  # type: ignore[arg-type]
         crn=True,
     )

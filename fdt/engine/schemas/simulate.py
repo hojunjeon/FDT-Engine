@@ -51,8 +51,13 @@ class PathStats(_Base):
     `economic=False` 로 부르면 `median`/`p10`/`p90`/`mean`/`min_balance`/
     `end_balance_median` 은 실제 잔액(`balances`) 기준이고, `economic=True`
     면 경제 잔액(`economic`) 기준이다. `shortfall_prob`/`card_shortfall_prob`/
-    `first_shortfall_date_median` 은 SPEC 7.2 8단계 정의상 항상 **실제
-    잔액**(`liquidity < 0`) 기준이라 `economic` 플래그와 무관하게 같다.
+    `first_shortfall_date_median` 은 `economic` 플래그와 무관하게 같은 값이다
+    - "부족" 자체가 실제 잔액도 경제 잔액도 아닌 **관측 가능한 결제 실패
+    사건**(카드 출금 실패 또는 미납 고정비 또는 억제된 소비/돌발 수요, SPEC 7.2
+    8단계, 리뷰 B1/S45)으로 정의되기 때문이다. 경제 잔액(`economic=True`)
+    은 청구서 float 까지 포함한 잠재 부담의 크기를 보는 지표로는 유용하지만,
+    그 자체가 음수라는 사실만으로는 "부족" 이 아니다(주 단위 카드 청구
+    주기를 쓰는 사용자는 정상 상태에서도 상시 음수일 수 있다).
     """
 
     dates: list[date]

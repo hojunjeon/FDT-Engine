@@ -90,12 +90,28 @@ def _envelope_name(envelope_id: int) -> str:
     return f"봉투{envelope_id}"
 
 
+def _joined_action_label(actions: list[Any], rank: int) -> str:
+    """조합 후보 라벨을 이어붙인다 (B8, `facts.py` 의 같은 이름 함수와 규칙
+    동일 - `ra.actions[0].label` 만 읽으면 2 행동 조합이 1위와 같은 라벨로
+    보인다)."""
+
+    labels = [a.label for a in actions if a.label]
+    if labels:
+        return "; ".join(labels)
+    return f"행동 {rank}위"
+
+
 # ---------------------------------------------------------------------------
 # FORECAST
 # ---------------------------------------------------------------------------
 
 
-def _viz_forecast(result: ForecastResult, facts_by_key: dict[str, Fact], as_of: date) -> list[Viz]:
+def _viz_forecast(
+    result: ForecastResult,
+    facts_by_key: dict[str, Fact],
+    as_of: date,
+    horizon_days: int | None = None,
+) -> list[Viz]:
     min_label = f"최저점 {_render(facts_by_key, 'min_balance_median')}".strip()
     line_band = LineBandViz(
         id="balance_trajectory",
@@ -165,7 +181,12 @@ def _viz_forecast(result: ForecastResult, facts_by_key: dict[str, Fact], as_of: 
 # ---------------------------------------------------------------------------
 
 
-def _viz_whatif(result: WhatIfResult, facts_by_key: dict[str, Fact], as_of: date) -> list[Viz]:
+def _viz_whatif(
+    result: WhatIfResult,
+    facts_by_key: dict[str, Fact],
+    as_of: date,
+    horizon_days: int | None = None,
+) -> list[Viz]:
     length = len(result.base.trajectory.median)
     dates = _dates_or_fallback(
         result.branch.trajectory.dates or result.base.trajectory.dates, as_of, length
@@ -245,7 +266,12 @@ def _goal_level(achieve_prob: float) -> str:
     return "DANGER"
 
 
-def _viz_goal(result: GoalResult, facts_by_key: dict[str, Fact], as_of: date) -> list[Viz]:
+def _viz_goal(
+    result: GoalResult,
+    facts_by_key: dict[str, Fact],
+    as_of: date,
+    horizon_days: int | None = None,
+) -> list[Viz]:
     gauge_value = result.achieve_prob * 100
     gauge = GaugeViz(
         id="achieve_prob",
@@ -291,7 +317,10 @@ def _viz_goal(result: GoalResult, facts_by_key: dict[str, Fact], as_of: date) ->
 
     # GoalResult 에는 잔액 궤적이 없어(SPEC 8.4), line_band 는 주차 누적 상한을
     # 대체 시계열로 쓴다. p10/p90 밴드에 해당하는 값이 없어 중앙값과 동일하게
-    # 채운 퇴화(degenerate) 밴드다 - SPEC 과 다르게 한 점(보고 참조).
+    # 채운 퇴화(degenerate) 밴드다 - SPEC 과 다르게 한 점(보고 참조, N16).
+    # SPEC 9.4 는 GOAL line_band 에 "목표선 hline" 을 요구한다 - 퇴화 밴드는
+    # 그대로 두고, `total_discretionary_cap`(총 재량 지출 한도) 를 그
+    # 목표선으로 그린다.
     if week_dates:
         cumulative: list[float] = []
         running = 0.0
@@ -304,6 +333,17 @@ def _viz_goal(result: GoalResult, facts_by_key: dict[str, Fact], as_of: date) ->
         line_x = [as_of]
         line_y = [0.0]
 
+    goal_line_annotations = []
+    cap_fact = facts_by_key.get("total_discretionary_cap")
+    if cap_fact is not None:
+        goal_line_annotations.append(
+            Annotation(
+                type="hline",
+                y=float(cap_fact.value),
+                label=f"총 재량 지출 한도 {_render(facts_by_key, 'total_discretionary_cap')}",
+            )
+        )
+
     line_band = LineBandViz(
         id="goal_cap_trajectory",
         title="목표 누적 지출 상한",
@@ -313,6 +353,7 @@ def _viz_goal(result: GoalResult, facts_by_key: dict[str, Fact], as_of: date) ->
             series=[LineSeries(name="누적 상한", y=line_y)],
             band=LineBand(lower=line_y, upper=line_y),
         ),
+        annotations=goal_line_annotations,
         caption=f"부족액(중앙값)은 {_render(facts_by_key, 'gap_median')}다.",
     )
 
@@ -324,10 +365,19 @@ def _viz_goal(result: GoalResult, facts_by_key: dict[str, Fact], as_of: date) ->
 # ---------------------------------------------------------------------------
 
 
-def _viz_risk(result: RiskResult, facts_by_key: dict[str, Fact], as_of: date) -> list[Viz]:
+def _viz_risk(
+    result: RiskResult,
+    facts_by_key: dict[str, Fact],
+    as_of: date,
+    horizon_days: int | None = None,
+) -> list[Viz]:
+    # S58: 제목의 "30일" 은 하드코딩이었다(`--horizon 60` 으로 실행해도
+    # "30일" 이 나왔다, 항목 7-1). `horizon_days` 를 받아 실제 요청값을
+    # 반영하고, 없으면(레거시 호출부) 숫자 없는 제목으로 낮춘다.
+    title = f"{horizon_days}일 결제 부족 위험" if horizon_days is not None else "결제 부족 위험"
     gauge = GaugeViz(
         id="risk",
-        title="30일 결제 부족 위험",
+        title=title,
         priority=1,
         data=GaugeData(
             value=result.risk_score, min=0, max=100, thresholds=[20, 50], level=result.level
@@ -417,18 +467,28 @@ def _optimize_effect_value(effect: dict[str, float | int | str], objective: str)
     return 0.0
 
 
-def _viz_optimize(result: OptimizeResult, facts_by_key: dict[str, Fact], as_of: date) -> list[Viz]:
+def _viz_optimize(
+    result: OptimizeResult,
+    facts_by_key: dict[str, Fact],
+    as_of: date,
+    horizon_days: int | None = None,
+) -> list[Viz]:
     unit = _optimize_unit(result.objective)
     items = []
     for ra in result.ranked:
-        label = ra.actions[0].label if ra.actions and ra.actions[0].label else f"행동 {ra.rank}위"
+        label = _joined_action_label(ra.actions, ra.rank)
         items.append(
             RankedItem(
                 rank=ra.rank,
                 label=label,
                 effect=_optimize_effect_value(ra.effect, result.objective),
                 unit=unit,
-                detail=ra.feasibility_note or "",
+                # B8/항목 7-1: `ra.feasibility_note` 는 `optimize.py` 가 만든
+                # 자유 문장으로, "이번 달 이미 사용 X원, 남은 한도 Y원" 처럼
+                # facts 에 등록되지 않은 금액을 그대로 담고 있다(§9.3 R7
+                # 위반). facts 로 등록하지 않은 값이므로 렌더러에 넘기지
+                # 않는다(리뷰 수정 지시의 두 옵션 중 "비운다" 쪽을 택함).
+                detail="",
             )
         )
 
@@ -467,7 +527,7 @@ def _viz_optimize(result: OptimizeResult, facts_by_key: dict[str, Fact], as_of: 
     return [ranked_bars, delta_bars]
 
 
-_MODE_BUILDERS: dict[Mode, Callable[[Any, dict[str, Fact], date], list[Viz]]] = {
+_MODE_BUILDERS: dict[Mode, Callable[[Any, dict[str, Fact], date, int | None], list[Viz]]] = {
     Mode.FORECAST: _viz_forecast,
     Mode.WHATIF: _viz_whatif,
     Mode.GOAL: _viz_goal,
@@ -476,14 +536,27 @@ _MODE_BUILDERS: dict[Mode, Callable[[Any, dict[str, Fact], date], list[Viz]]] = 
 }
 
 
-def build_viz(mode: Mode, result: ResultUnion, facts: list[Fact], *, as_of: date) -> list[Viz]:
-    """모드별 result + facts -> viz 명세 목록 (SPEC 9.3, 9.4)."""
+def build_viz(
+    mode: Mode,
+    result: ResultUnion,
+    facts: list[Fact],
+    *,
+    as_of: date,
+    horizon_days: int | None = None,
+) -> list[Viz]:
+    """모드별 result + facts -> viz 명세 목록 (SPEC 9.3, 9.4).
+
+    `horizon_days` 는 요청(`ModeRequest.horizon_days`) 값을 그대로 받는다
+    (S58) - 지금은 RISK gauge 제목만 실제로 쓴다("30일" 하드코딩 결함,
+    항목 7-1). 다른 모드는 이미 구체적인 날짜/기간을 결과에서 뽑아 쓰므로
+    받기만 하고 쓰지 않는다(자리만 맞춘다).
+    """
 
     builder = _MODE_BUILDERS.get(mode)
     if builder is None:
         raise ValueError(f"알 수 없는 모드: {mode!r}")
     facts_by_key = _facts_by_key(facts)
-    return builder(result, facts_by_key, as_of)  # type: ignore[arg-type]
+    return builder(result, facts_by_key, as_of, horizon_days)  # type: ignore[arg-type]
 
 
 __all__ = ["build_viz"]

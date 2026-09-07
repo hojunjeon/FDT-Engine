@@ -28,34 +28,46 @@ import 하는 계약): `simulate`, `Overrides`, `SimulationResult`.
   용량은 `len(초기 issued_unpaid) + horizon_days//7 + 4`(매주 최대 한 장만
   새로 쌓이므로 이 상한을 넘을 일이 거의 없다)로 잡고, 그래도 넘치면
   `_grow_card_capacity` 가 두 배로 늘린다.
-- **벡터화 근사(중요, 보고서 참조).** 생성기(`fdt/gen/generator.py`)는
-  거래 하나하나를 순서대로 잔액에 반영하지만, SPEC 7.1/7.2 자신이 "포아송은
-  `rng.poisson(λ, n_paths)`, 금액은 총 건수만큼 한 번에 뽑는다" 고 벡터화를
-  명시적으로 요구한다. 그래서 이 시뮬레이터는 하루·봉투·경로 단위로
-  "현금 합계 대 잔액" 을 한 번만 비교한다(그 합계가 부족하면 그 날 그
-  봉투의 현금 지출 전부가 억제된다) - 거래를 하나씩 순서대로 판정하는
-  생성기보다 거칠지만, SPEC 이 명시한 벡터화 방향과 정확히 같다.
-- **CRN(공통 난수).** `rng_main = default_rng(seed)` 가 수입 잡음·소비
-  건수/금액·카드-현금 배정·돌발을 전부 뽑고, `rng_inj = default_rng(seed +
-  10_007)` 는 주입 전용으로 예약해 둔다. SPEC 8.3 표의 주입 7종은 전부
-  **결정론적 금액**(무작위 요소가 없다)이라 현재는 `rng_inj` 를 실제로
-  소비하는 경로가 없다 - 그래도 자리를 분리해 두는 이유는 향후 주입에
-  무작위 요소가 추가돼도 `rng_main` 의 소비 순서가 흔들리지 않게 하기
-  위해서다. `injections` 유무·`overrides` 유무가 `rng_main` 이 소비하는
-  난수의 "개수" 자체에 영향을 주는 경우는 딱 하나 남아 있다:
-  `BUDGET_CHANGE(behavior_follows=true)` 가 elasticity_gate 문턱을
-  바꾸면 그 봉투의 포아송 λ 가 달라지고, 그 결과 그날 뽑는 로그정규 표본
-  개수(`total_n`)도 달라진다 - 이건 "예산이 바뀌면 소비 분포 자체가
-  바뀐다" 는 SPEC 의 의도된 효과이지 버그가 아니다(§6 설명 참조). 순수
-  `SPEND`/`INCOME`/`RECURRING_SPEND`/`EMERGENCY_DRAW`/`FIXED_CHANGE`/
-  `EXTERNAL(price_index_mult만)` 주입은 λ 를 전혀 건드리지 않으므로 이
-  경우엔 완전히 동일한 순서로 소비된다(테스트로 고정) - 그래서 `SPEND`/
-  `RECURRING_SPEND` 주입이 늘리는 지출은 `elasticity_gate` 가 보는 누적치
-  (`gate_spent`)에는 절대 합산하지 않고, 출력용 누적치(`injected_spent`,
-  둘을 더한 값이 `envelope_spend`)에만 더한다 - 주입 자체가 "그 봉투가
-  저잔여 구간에 들어가는 시점" 을 앞당겨 버리면 그 뒤 모든 날짜의 λ 가
-  갈라져 `rng_main` 표본 개수가 달라지고, 결국 "주입 유무로 소비 난수
-  순서가 안 바뀐다" 는 SPEC 요구를 깨기 때문이다.
+- **벡터화 근사, 부분 체결(리뷰 B2/S46 수정 반영).** 생성기
+  (`fdt/gen/generator.py`)는 거래 하나하나를 순서대로 잔액에 반영하지만,
+  SPEC 7.1/7.2 자신이 "포아송은 `rng.poisson(λ, n_paths)`, 금액은 총
+  건수만큼 한 번에 뽑는다" 고 벡터화를 명시적으로 요구한다. 그래서 이
+  시뮬레이터는 하루·봉투·경로 단위로 현금 지출 합계를 한 번에 계산하되,
+  그 합계를 잔액에 **부분 체결**한다(`paid = min(cash_total, liquidity)`,
+  나머지는 `suppressed_demand`) - 거래를 하나씩 순서대로 판정하는 생성기와
+  결과가 완전히 같지는 않지만, "감당하는 만큼만 나가고 나머지만 억제된다"
+  는 성질은 같다. 이전 버전은 그 합계가 조금이라도 잔액을 넘으면 그 날 그
+  봉투의 현금 지출 **전부**를 억제했는데(전부-또는-전무), 이는 SPEC 이
+  명시한 것은 벡터화 "방향" 이지 "판정 입도" 가 아니었다 - 실측상 C 프로필
+  (현금 지출이 잔액 대비 상시 빠듯한 프로필) 백테스트 sMAPE 를 기준 초과로
+  악화시켰다(리뷰 B2). 주입 경로(아래 "7. 주입" 참조)는 처음부터 이
+  부분 체결 방식을 썼다 - 이번 수정으로 정규 소비(5단계)·돌발(6단계)도
+  같은 규칙으로 통일했다.
+- **CRN(공통 난수) - 실제로 성립하는 것과 안 하는 것 (N6, 정직하게 다시
+  적음).** `rng_main = default_rng(seed)` 가 수입 잡음·소비 건수/금액·
+  카드-현금 배정·돌발을 전부 뽑고, `rng_inj = default_rng(seed + 10_007)`
+  는 주입 전용으로 예약해 둔다(SPEC 8.3 주입 7종이 전부 결정론적 금액이라
+  현재는 실제로 소비되지 않지만, 향후 주입에 무작위 요소가 생겨도
+  `rng_main` 소비 순서가 흔들리지 않도록 자리를 분리해 둔다). **확실히
+  성립하는 것**: `injections`·`overrides` 가 전혀 없으면 두 번의 `simulate()`
+  호출은 바이트 단위로 동일하다(테스트로 고정, `whatif.py` 의 CRN 브랜치가
+  이것에 의존한다). **성립하지 않는 것**: "순수 SPEND/INCOME/RECURRING_
+  SPEND/EMERGENCY_DRAW 주입은 이후 소비 난수 소비 순서를 전혀 안 바꾼다"
+  는 이전 버전 docstring의 주장은 거짓이었다(리뷰 W6 4a 실측) -
+  `SPEND`/`RECURRING_SPEND` 주입이 늘리는 지출은 `elasticity_gate` 가
+  보는 누적치(`gate_spent`)에는 합산하지 않지만(`injected_spent`에만
+  더함, 아래), `INCOME`/`EMERGENCY_DRAW`/`SPEND` 주입은 모두 `liquidity`
+  자체를 바꾸고, `liquidity` 는 5단계 정규 소비의 현금 부분 체결
+  (`paid = min(cash_total, liquidity)`)이 매일 참조하는 공유 상태다 -
+  그래서 주입이 있으면 이후 날짜 정규 소비의 `paid`(따라서 `gate_spent`,
+  `remaining_ratio`, `gate`, λ, 그날 뽑는 로그정규 표본 개수)가 주입 없는
+  분기와 달라질 수 있다. 이 어긋남은 봉투 현금 지출이 잔액 대비 빠듯한
+  프로필(B·C)에서만 관측되고(A·D 는 무해), 그 근본 해결(주입이 `paid` 에
+  영향을 주지 않게 하려면 정규 소비와 주입을 완전히 분리된 잔액으로
+  추적해야 한다)은 이번 수정 범위 밖이다(S46 이후 과제). `BUDGET_CHANGE
+  (behavior_follows=true)` 가 elasticity_gate 문턱을 바꿔 λ 가 달라지는
+  것은 "예산이 바뀌면 소비 분포 자체가 바뀐다" 는 SPEC 의 의도된 효과다
+  (§6 설명 참조, 버그 아님).
 """
 
 from __future__ import annotations
@@ -148,13 +160,32 @@ class Overrides:
     """시뮬 기간 동안만 적용하는 상태 변경 (SPEC 7.1). 원본 `State` 는
     건드리지 않는다 - `simulate()` 는 이 필드들을 지역 변수/배열로만
     읽는다.
+
+    `budgets`: elasticity_gate 문턱까지 바꾸는 "행동 추종" 예산 변경(주입
+    `BUDGET_CHANGE(behavior_follows=true)` 와 같은 효과, GOAL 러너가 씀).
+    `hard_caps`(S55): 봉투별 이번 달 누적 **체결분**(gate_spent, 주입은
+    포함하지 않음)이 이 캡에 닿으면 그 달 남은 기간 그 봉투의 λ 를 0 으로
+    만든다 - "예산을 줄이면 그만큼만 덜 쓴다" 는 소프트 유도(behavior_
+    follows)와 달리 하드 상한이다. GOAL 이 재시뮬로 목표 달성 가능성을
+    검증할 때 쓴다(리뷰 B5: 소프트 캡은 확정 예산을 오히려 인상해
+    `plan_achieve_prob` 이 역행하는 결함이 있었다). 필수 봉투 하한(80%
+    등)은 호출자가 이미 하한을 반영한 캡 값을 넘겨야 한다 - 이 함수는
+    그 값을 그대로 하드 상한으로 쓸 뿐 별도 하한 로직을 넣지 않는다.
+    `committed_amount_override`(B4): 키는 `f"{kind}:{source_id}"`
+    (`source_id` 는 `source_fixed_expense_id` 또는 `source_loan_id`) -
+    그 약정 큐 항목의 금액을 지정한 값으로 덮어쓴다.
+    `card_withdrawal_weekday`: 카드 id -> 요일(0=월). 청구 발행/카드
+    출금 예정일 계산에 그대로 반영된다(§8.6.1 네 번째 AUTO 후보).
+    `cancel_committed`: `source_fixed_expense_id` 집합 - 그 항목을 약정
+    스케줄에서 제거한다.
     """
 
     budgets: dict[int, int] | None = None
     cancel_committed: set[int] | None = None
-    committed_amount_override: dict[int, int] | None = None
+    committed_amount_override: dict[str, int] | None = None
     externals: Externals | None = None
     card_withdrawal_weekday: dict[int, int] | None = None
+    hard_caps: dict[int, int] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -289,16 +320,23 @@ def simulate(
 
     ov = overrides or Overrides()
     eff_externals = ov.externals or externals
-    budgets_map: dict[int, int] = dict(ov.budgets or {})
+    # `gate_budgets_map`: elasticity_gate 문턱 계산에만 쓰는 예산(behavior_
+    # follows 예산 변경). `display_budgets_map`: 실제 봉투 예산(exhaustion/
+    # envelope_budgets 출력)에 쓰는 예산 - `Overrides.budgets` 는 둘 다
+    # 바꾸지만(GOAL 의 기존 "행동 추종" 캡 용법과 호환), 주입
+    # `BUDGET_CHANGE(behavior_follows=false)` 는 후자만 바꾼다(B3 수정).
+    gate_budgets_map: dict[int, int] = dict(ov.budgets or {})
+    display_budgets_map: dict[int, int] = dict(ov.budgets or {})
+    hard_cap_map: dict[int, int] = dict(ov.hard_caps or {})
     cancel_set: set[int] = set(ov.cancel_committed or ())
-    amount_override_map: dict[int, int] = dict(ov.committed_amount_override or {})
+    amount_override_map: dict[str, int] = dict(ov.committed_amount_override or {})
     card_weekday_override: dict[int, int] = dict(ov.card_withdrawal_weekday or {})
 
     # `FixedChangeInjection.from_` 는 스키마상 `date | None` 이지만
     # `_check_change` 검증기가 항상 값을 요구하므로 실제로는 None 이 될 수
     # 없다(SPEC 8.3 S8: "from(적용 시작일) 필수").
     fixed_change: dict[int, tuple[date | None, int | None, bool]] = {}
-    day_spend: dict[date, list[tuple[int, int, str]]] = {}
+    day_spend: dict[date, list[tuple[int, int, str, int | None]]] = {}
     day_income: dict[date, list[int]] = {}
     day_emergency_draw: dict[date, list[int]] = {}
     horizon_end = as_of + timedelta(days=horizon_days)
@@ -308,8 +346,15 @@ def simulate(
         # (중간 변수에 복사하면 좁혀지지 않는다) - 그래서 각 분기가
         # `inj.type ==` 를 직접 쓴다.
         if inj.type == "BUDGET_CHANGE":
+            # B3 수정: `behavior_follows` 와 무관하게 실제 예산(따라서
+            # envelope_budgets/exhaustion/overrun_prob)은 바뀐다. 소비
+            # 행동(elasticity_gate 문턱)만 `behavior_follows=true` 일 때
+            # 함께 바뀐다 - "예산만 줄이고 행동은 그대로면 얼마나
+            # 초과하나?" 라는 질문에 `false` 가 조용히 0 을 답하던 결함을
+            # 고친다(리뷰 B3, S53).
+            display_budgets_map[inj.envelope_id] = inj.new_budget
             if inj.behavior_follows:
-                budgets_map[inj.envelope_id] = inj.new_budget
+                gate_budgets_map[inj.envelope_id] = inj.new_budget
         elif inj.type == "FIXED_CHANGE":
             fixed_change[inj.fixed_expense_id] = (inj.from_, inj.new_amount, inj.cancel)
         elif inj.type == "EXTERNAL":
@@ -323,18 +368,23 @@ def simulate(
             eff_externals = eff_externals.model_copy(update=updates)
         elif inj.type == "SPEND":
             d = _resolve_event_date(inj.on, inj.days_from_now, as_of)
-            day_spend.setdefault(d, []).append((inj.envelope_id, inj.amount, inj.method))
+            card_id = getattr(inj, "card_id", None)  # N4: 스키마 필드는 J3 소유
+            day_spend.setdefault(d, []).append((inj.envelope_id, inj.amount, inj.method, card_id))
         elif inj.type == "INCOME":
             d = _resolve_event_date(inj.on, inj.days_from_now, as_of)
             day_income.setdefault(d, []).append(inj.amount)
         elif inj.type == "RECURRING_SPEND":
+            card_id = getattr(inj, "card_id", None)
             for d in _expand_recurring_dates(inj, as_of, horizon_end):
-                day_spend.setdefault(d, []).append((inj.envelope_id, inj.amount, inj.method))
+                day_spend.setdefault(d, []).append(
+                    (inj.envelope_id, inj.amount, inj.method, card_id)
+                )
         elif inj.type == "EMERGENCY_DRAW":
             d = _resolve_event_date(inj.on, inj.days_from_now, as_of)
             day_emergency_draw.setdefault(d, []).append(inj.amount)
 
     # -- 약정 큐를 일자별 스케줄로 (CARD_BILL 은 제외 - 모듈 docstring 참조) --
+    loan_rate_delta_bp = eff_externals.loan_rate_delta_bp
     committed_items = committed if committed is not None else list(state.committed)
     committed_by_date: dict[date, list[Committed]] = {}
     for item in committed_items:
@@ -342,10 +392,33 @@ def simulate(
             continue
         fx_id = item.source_fixed_expense_id
         amount = item.amount
+
+        # B4: `EXTERNAL.loan_rate_delta_bp` 가 대출이자 금액에 실제 영향을
+        # 주려면 여기서 rate 를 다시 계산해야 한다(build 시점 큐는 그
+        # 시점의 delta 로 이미 고정돼 있다). `INTEREST_ONLY` 만 재계산
+        # 가능하다 - `AMORTIZING` 은 원금균등분할 가정(`term_months`)을
+        # 다시 풀어야 정확한 재계산이 되는데 그 가정 자체가 build 쪽에만
+        # 있어 여기서는 재현할 수 없다(한계를 그대로 둔다, 리뷰 B4 결정).
+        if (
+            item.kind == "LOAN"
+            and item.loan_repayment == "INTEREST_ONLY"
+            and item.rate_pct is not None
+            and item.principal is not None
+        ):
+            adjusted_rate_pct = item.rate_pct + loan_rate_delta_bp / 100
+            monthly_rate = adjusted_rate_pct / 100 / 12
+            amount = round(item.principal * monthly_rate / 10) * 10
+
         if fx_id is not None and fx_id in cancel_set:
             continue
-        if fx_id is not None and fx_id in amount_override_map:
-            amount = amount_override_map[fx_id]
+        # B4: `committed_amount_override` 키는 `f"{kind}:{source_id}"`
+        # (source_id 는 source_fixed_expense_id 또는 source_loan_id) - 이
+        # 항목이 명시적으로 지정되면 위 대출 재계산 결과보다 우선한다.
+        src_id = fx_id if fx_id is not None else item.source_loan_id
+        if src_id is not None:
+            override_key = f"{item.kind}:{src_id}"
+            if override_key in amount_override_map:
+                amount = amount_override_map[override_key]
         if fx_id is not None and fx_id in fixed_change:
             from_date, new_amount, cancel = fixed_change[fx_id]
             assert from_date is not None  # 검증기가 보장(위 주석 참조)
@@ -373,9 +446,18 @@ def simulate(
     avg_card_share = float(card_share.mean()) if n_env else 0.0
 
     state_env_by_id = {es.envelope_id: es for es in state.envelopes}
+    # `budget_arr`: 실제 예산(exhaustion/envelope_budgets 출력에 쓴다).
+    # `gate_budget_arr`: elasticity_gate 문턱 계산에만 쓴다(B3 수정 - 둘을
+    # 분리해야 `BUDGET_CHANGE(behavior_follows=false)` 가 "예산은 바뀌지만
+    # 소비 행동은 그대로" 를 표현할 수 있다).
     budget_arr = np.array(
-        [budgets_map.get(e, state_env_by_id[e].budget) for e in env_ids], dtype=np.int64
+        [display_budgets_map.get(e, state_env_by_id[e].budget) for e in env_ids], dtype=np.int64
     )
+    gate_budget_arr = np.array(
+        [gate_budgets_map.get(e, state_env_by_id[e].budget) for e in env_ids], dtype=np.int64
+    )
+    # S55: 봉투별 하드 캡(-1 = 캡 없음). GOAL 이 재시뮬 검증에 쓴다.
+    hard_cap_arr = np.array([hard_cap_map.get(e, -1) for e in env_ids], dtype=np.int64)
     spent_init = np.array([state_env_by_id[e].spent for e in env_ids], dtype=np.int64)
 
     # -- 수입 일정 (SPEC 5.1 income, 6장 payday_boost/pre_payday_damp) ---
@@ -570,7 +652,7 @@ def simulate(
                     pending_bill_records.append(
                         {
                             "card_id": card.id,
-                            "name": f"카드 {card.id} 대금",
+                            "name": f"카드대금 {card.card_name}",  # S47/N2: 큐와 이름 통일
                             "due": first_due,
                             "amounts": unbilled[ci].copy(),
                             "has_bill": has_bill.copy(),
@@ -618,7 +700,7 @@ def simulate(
                 day_events.append(
                     Event(
                         kind="CARD_BILL",
-                        name=f"카드 {card.id} 대금 출금",
+                        name=f"카드대금 {card.card_name}",  # S47/N2: 큐와 이름 통일
                         amount=round(float(np.median(attempted_amt[attempted_today]))),
                         success_ratio=sr,
                         source_card_id=card.id,
@@ -661,15 +743,24 @@ def simulate(
         if next_income_date is not None and 1 <= (next_income_date - d).days <= 5:
             boost *= pre_payday_damp
 
-        budget_f = np.where(budget_arr > 0, budget_arr, 1).astype(np.float64)
+        # B3: elasticity_gate 문턱은 `gate_budget_arr`(behavior_follows 예산)
+        # 로 계산한다 - 실제 봉투 예산(`budget_arr`, exhaustion/출력용)과
+        # 분리한다.
+        budget_f = np.where(gate_budget_arr > 0, gate_budget_arr, 1).astype(np.float64)
         remaining_ratio = 1.0 - gate_spent.astype(np.float64) / budget_f[None, :]
         gate = np.where(remaining_ratio < 0.2, elasticity[None, :], 1.0)
-        gate[:, budget_arr <= 0] = 1.0
+        gate[:, gate_budget_arr <= 0] = 1.0
 
         for ei, _eid in enumerate(env_ids):
             lam = np.clip(
                 daily_rate[ei] * weekday_mult[ei, weekday] * boost * gate[:, ei], 0.0, None
             )
+            if hard_cap_arr[ei] >= 0:
+                # S55: 이번 달 누적 체결분(gate_spent, 주입 제외)이 하드
+                # 캡에 닿은 경로는 그 달 남은 기간 이 봉투의 λ 를 0 으로
+                # 만든다(GOAL 재시뮬 전용, 리뷰 B5).
+                capped = gate_spent[:, ei] >= hard_cap_arr[ei]
+                lam = np.where(capped, 0.0, lam)
             n_events = rng_main.poisson(lam)
             total_n = int(n_events.sum())
             if total_n > 0:
@@ -709,26 +800,29 @@ def simulate(
                                         minlength=n_paths,
                                     ).astype(np.int64)
 
-                needs_cash = cash_total > 0
-                afford = liquidity >= cash_total
-                pay_mask = needs_cash & afford
-                fail_mask = needs_cash & ~afford
-                liquidity[pay_mask] -= cash_total[pay_mask]
-                suppressed_demand_cum[fail_mask] += cash_total[fail_mask]
+                # B2/S46: 하루·봉투 합계 현금 지출을 부분 체결한다 - 감당
+                # 가능한 만큼만 잔액에서 나가고 나머지는 suppressed_demand
+                # 로 넘어간다(주입 경로 "7. 주입" 과 같은 규칙, 모듈
+                # docstring "벡터화 근사" 참조). 이전 버전의 전부-또는-전무
+                # 게이트는 C 프로필 백테스트를 기준 초과로 악화시켰다.
+                paid = np.minimum(cash_total, liquidity)
+                liquidity -= paid
+                suppressed_demand_cum += cash_total - paid
 
                 card_success_total = np.zeros(n_paths, dtype=np.int64)
                 if n_cards > 0:
                     card_success_total = np.bincount(
                         path_index, weights=np.where(via_card, amounts, 0), minlength=n_paths
                     ).astype(np.int64)
-                successful = np.where(pay_mask, cash_total, 0) + card_success_total
+                successful = paid + card_success_total
                 gate_spent[:, ei] += successful
 
             envelope_spend[:, ei, k] = gate_spent[:, ei] + injected_spent[:, ei]
-            newly_exhausted = (envelope_spend[:, ei, k] >= budget_arr[ei]) & (
-                first_exhaust_idx[:, ei] < 0
-            )
-            first_exhaust_idx[newly_exhausted, ei] = k
+            if budget_arr[ei] > 0:  # N3: 예산 0 봉투는 "소진" 판정에서 제외
+                newly_exhausted = (envelope_spend[:, ei, k] >= budget_arr[ei]) & (
+                    first_exhaust_idx[:, ei] < 0
+                )
+                first_exhaust_idx[newly_exhausted, ei] = k
 
         # 6. 돌발 ----------------------------------------------------------
         other_idx = env_index.get(7)
@@ -737,7 +831,9 @@ def simulate(
             hit_count = int(hit_mask.sum())
             if hit_count > 0:
                 raw = rng_main.lognormal(mean=shock_mu, sigma=shock_sigma, size=hit_count)
-                shock_amounts = (np.round(raw / 100.0) * 100).astype(np.int64)
+                # N7: 5단계 정규 소비와 대칭으로 price_index_mult 를 곱한다
+                # (SPEC 7.2 6단계는 이를 명시하지 않지만 비대칭을 없앤다).
+                shock_amounts = (np.round(raw * price_index_mult / 100.0) * 100).astype(np.int64)
                 via_card = rng_main.random(hit_count) < avg_card_share
                 hit_paths = np.nonzero(hit_mask)[0]
 
@@ -760,24 +856,23 @@ def simulate(
                 else:
                     cash_total[hit_paths] = shock_amounts
 
-                needs_cash = cash_total > 0
-                afford = liquidity >= cash_total
-                pay_mask = needs_cash & afford
-                fail_mask = needs_cash & ~afford
-                liquidity[pay_mask] -= cash_total[pay_mask]
-                suppressed_demand_cum[fail_mask] += cash_total[fail_mask]
+                # B2/S46: 5단계와 같은 부분 체결 규칙(위 참조).
+                paid = np.minimum(cash_total, liquidity)
+                liquidity -= paid
+                suppressed_demand_cum += cash_total - paid
 
                 card_success = np.zeros(n_paths, dtype=np.int64)
                 card_success[hit_paths] = np.where(via_card, shock_amounts, 0)
-                successful = np.where(pay_mask, cash_total, 0) + card_success
+                successful = paid + card_success
                 gate_spent[:, other_idx] += successful
                 envelope_spend[:, other_idx, k] = (
                     gate_spent[:, other_idx] + injected_spent[:, other_idx]
                 )
-                newly_exhausted = (
-                    envelope_spend[:, other_idx, k] >= budget_arr[other_idx]
-                ) & (first_exhaust_idx[:, other_idx] < 0)
-                first_exhaust_idx[newly_exhausted, other_idx] = k
+                if budget_arr[other_idx] > 0:  # N3
+                    newly_exhausted = (
+                        envelope_spend[:, other_idx, k] >= budget_arr[other_idx]
+                    ) & (first_exhaust_idx[:, other_idx] < 0)
+                    first_exhaust_idx[newly_exhausted, other_idx] = k
 
         # 7. 주입 -----------------------------------------------------------
         for income_amt in day_income.get(d, []):
@@ -794,10 +889,16 @@ def simulate(
                 Event(kind="EMERGENCY_DRAW", name="비상금 인출", amount=draw_amt, success_ratio=1.0)
             )
 
-        for envelope_id, spend_amount, method in day_spend.get(d, []):
+        for envelope_id, spend_amount, method, spend_card_id in day_spend.get(d, []):
             ei = env_index[envelope_id]
             if method == "CARD" and n_cards > 0:
-                unbilled[0] += spend_amount
+                # N4: 명시된 카드가 있으면 그 카드로, 없으면 첫 관리 카드로
+                # (이전 버전은 항상 `unbilled[0]` 이라 출금 요일이 다른 카드가
+                # 여럿이면 어느 카드로 잡히는지가 결과를 바꿨다).
+                card_idx = 0
+                if spend_card_id is not None and spend_card_id in card_id_to_idx:
+                    card_idx = card_id_to_idx[spend_card_id]
+                unbilled[card_idx] += spend_amount
                 injected_spent[:, ei] += spend_amount
                 envelope_spend[:, ei, k] = gate_spent[:, ei] + injected_spent[:, ei]
                 day_events.append(
@@ -824,10 +925,11 @@ def simulate(
                 day_events.append(
                     Event(kind="SPEND", name="주입 소비", amount=spend_amount, success_ratio=sr)
                 )
-            newly_exhausted = (envelope_spend[:, ei, k] >= budget_arr[ei]) & (
-                first_exhaust_idx[:, ei] < 0
-            )
-            first_exhaust_idx[newly_exhausted, ei] = k
+            if budget_arr[ei] > 0:  # N3
+                newly_exhausted = (envelope_spend[:, ei, k] >= budget_arr[ei]) & (
+                    first_exhaust_idx[:, ei] < 0
+                )
+                first_exhaust_idx[newly_exhausted, ei] = k
 
         # 8. 기록 ------------------------------------------------------------
         if day_events:
@@ -836,18 +938,24 @@ def simulate(
         economic[:, k] = (
             liquidity - _issued_unpaid_sum() - unpaid_obligation_cum - suppressed_demand_cum
         )
-        # W7 최소 수정(오케스트레이터 결정, SPEC 7.2 8단계 "liquidity < 0 ->
-        # any_shortfall"의 실제 의미): `liquidity`(실제 잔액)는 모든 단계가
-        # "감당 못 하면 거절" 로 게이트돼 있어 구조적으로 절대 음수가 되지
-        # 않는다(W6 조사 노트, tests/unit/test_simulate.py 의
-        # test_profile_stats_invariants 주석 참조) - 그래서 `liquidity < 0`
-        # 를 그대로 쓰면 `shortfall_prob` 이 항상 0에 수렴해 RISK/FORECAST
-        # 어디에도 못 쓴다. SPEC 8.5 는 애초에 "부족"을 경제 잔액(청구서·
-        # 미납·억제 수요까지 반영한 잠재 부족)으로 정의하므로, 여기서는
-        # `economic`(이미 위에서 계산)을 판정 기준으로 쓴다.
-        newly_short = (economic[:, k] < 0) & (~any_shortfall)
+        # B1/S45(리뷰 이탈 (d) 수정): "부족"을 **관측 가능한 결제 실패
+        # 사건**으로 정의한다 - 카드 출금 실패(`card_shortfall`) 또는 미납
+        # 고정비(`unpaid_obligation_cum > 0`) 또는 억제된 소비/돌발 수요
+        # (`suppressed_demand_cum > 0`). 이전 버전(`economic < 0`)은
+        # `issued_unpaid`(정상적으로 예정된 카드 청구서 float)까지 부족으로
+        # 세어, 주 단위 청구 주기를 쓰는 카드 사용자는 실제 결제 실패가
+        # 전혀 없어도 `shortfall_prob` 이 상시 절반 가까이 나오는 오탐을
+        # 만들었다(리뷰 B1 실측, B 프로필 오탐률 약 45%). 새 정의는
+        # 정답 데이터의 카드 부족·거절 결제 이력(SPEC 11장)과 1:1 대응하므로
+        # Phase 7 캘리브레이션이 성립한다. `economic`(위 줄)은
+        # 지표로는 계속 노출하되(§8.2 `economic` 필드, `stats(economic=True)`)
+        # 이 판정에는 쓰지 않는다. `card_shortfall`/`unpaid_obligation_cum`/
+        # `suppressed_demand_cum` 은 전부 단조 비감소(사건이 한 번 일어나면
+        # 계속 참/양수)이므로 이 사건도 한 번 True 가 되면 계속 True 다.
+        day_short = card_shortfall | (unpaid_obligation_cum > 0) | (suppressed_demand_cum > 0)
+        newly_short = day_short & (~any_shortfall)
         first_shortfall_idx[newly_short] = k
-        any_shortfall |= economic[:, k] < 0
+        any_shortfall |= day_short
 
     event_log = [DayEvents(date=dates[k], events=events_by_day[k]) for k in sorted(events_by_day)]
 

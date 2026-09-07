@@ -363,8 +363,10 @@ def test_risk_score_zero_and_safe_when_no_shortfall_possible() -> None:
 
 def test_risk_score_100_and_danger_when_card_always_fails() -> None:
     """카드 미결제(500,000원)가 잔액(1,000원)보다 훨씬 커서 매 경로·매일
-    실패하는 결정론 시나리오(daily_rate=0). economic 잔액이 첫날부터 항상
-    음수라 shortfall_prob=card_shortfall_prob=1.0, risk_score=100, DANGER."""
+    실패하는 결정론 시나리오(daily_rate=0). 카드 출금이 첫날부터 계속
+    실패하므로(관측 가능한 결제 실패 사건, B1/S45) shortfall_prob=
+    card_shortfall_prob=1.0, risk_score=100, DANGER. `expected_shortfall`
+    은 그 미결제 카드 청구서 전액(다른 미납/억제 없음)이다."""
 
     as_of = date(2026, 9, 7)
     withdrawal_weekday = (as_of + timedelta(days=1)).weekday()
@@ -387,7 +389,7 @@ def test_risk_score_100_and_danger_when_card_always_fails() -> None:
     assert result.risk_score == 100
     assert result.level == "DANGER"
     assert result.worst_day == as_of + timedelta(days=1)
-    assert result.expected_shortfall == 499_000
+    assert result.expected_shortfall == 500_000
 
 
 # ---------------------------------------------------------------------------

@@ -11,8 +11,6 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-import numpy as np
-
 from fdt.engine.modes import register
 from fdt.engine.modes._common import make_context, run_sim, to_int
 from fdt.engine.schemas.request import ModeRequest, RiskParams
@@ -220,10 +218,18 @@ def run_risk(engine, req: ModeRequest) -> RiskResult:
 
     worst_day = stats_eco.first_shortfall_date_median or stats_eco.min_balance_date
 
+    # B1/S45: `expected_shortfall` 은 "부족 사건이 발생한 경로의 (미결제
+    # 카드 청구 잔액 + 미납 고정비 + 억제된 수요) 말일 합계 평균"이다.
+    # `balances[:, -1] - economic[:, -1]` 은 정의상
+    # `issued_unpaid_sum + unpaid_obligation_cum + suppressed_demand_cum`
+    # 의 말일 값과 같다(둘 다 `simulate()` 에서 그 식으로 계산됨) - 이전
+    # 버전의 "부족 경로 최저 경제 잔액의 절대값"은 카드 청구 float 의
+    # 크기를 재는 것이라 사건과 무관한 숫자를 냈다(리뷰 B1: B 프로필
+    # 191,623원이 실제 사건 0건에 대한 값이었다).
     any_shortfall = sim.any_shortfall
     if any_shortfall.any():
-        mins = sim.economic[any_shortfall].min(axis=1)
-        expected_shortfall = to_int(float(np.abs(mins).mean()))
+        shortfall_amount_final = sim.balances[:, -1] - sim.economic[:, -1]
+        expected_shortfall = to_int(float(shortfall_amount_final[any_shortfall].mean()))
     else:
         expected_shortfall = 0
 

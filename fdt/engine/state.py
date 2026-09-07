@@ -351,6 +351,7 @@ def _build_cards(twin: TwinInput, ledger: tuple[LedgerTx, ...], as_of: date) -> 
                 id=card.id,
                 withdrawal_weekday=card.withdrawal_weekday,
                 withdrawal_account_id=card.withdrawal_account_id,  # S33
+                card_name=card.card_name,  # S47
                 unbilled=unbilled,
                 issued_unpaid=issued_unpaid,
             )
@@ -477,6 +478,9 @@ def _loan_queue_items(
                     account_id=loan.withdrawal_account_id,
                     card_id=None,
                     source_loan_id=loan.id,
+                    rate_pct=loan.annual_rate_pct,  # B4
+                    principal=loan.balance,
+                    loan_repayment=loan.repayment.value,
                 )
             )
     return items

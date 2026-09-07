@@ -460,6 +460,63 @@ def test_dutch_pay_reduces_envelope_true_spend() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 비상금 자기이체 잔액 가드 (리뷰 B6/S62, SPEC §7.2 2단계)
+# ---------------------------------------------------------------------------
+
+
+def _profile_with_emergency(*, opening_balance: int, emergency_amt: int) -> dict:
+    profile = _minimal_profile()
+    profile["accounts"][0]["opening_balance"] = opening_balance
+    profile["accounts"].append(
+        {
+            "id": 11,
+            "alias": "비상금계좌",
+            "is_income": False,
+            "opening_balance": 0,
+            "managed": True,
+        }
+    )
+    profile["hidden"]["emergency_transfer_monthly"] = emergency_amt
+    return profile
+
+
+def test_emergency_transfer_succeeds_when_primary_balance_sufficient() -> None:
+    """양성 대조: 잔액이 이체액 이상이면(급여 유입 후) 매달 정상적으로
+    이체된다 - 가드가 정상 경로까지 막지 않는지 확인한다. 2개월치 급여(1일,
+    25일 지급 x 2회)에서 각각 300,000 씩 이체된다."""
+
+    profile = _profile_with_emergency(opening_balance=100_000, emergency_amt=300_000)
+    gen = Generator(profile, seed=1, months=1, end=date(2026, 9, 30))
+    gen.run()
+
+    primary = gen.accounts[10]
+    emer = gen.accounts[11]
+    self_transfers = [tx for tx in gen.transactions if tx.get("exclude_tag") == "SELF_TRANSFER"]
+
+    assert len(self_transfers) == 2
+    assert emer.balance == 600_000
+    assert primary.balance == 100_000 + 2 * 1_000_000 - 2 * 300_000
+
+
+def test_emergency_transfer_skipped_no_retry_when_still_insufficient() -> None:
+    """급여가 들어온 뒤에도 PRIMARY 가 이체액에 못 미치면 그 달은 이체를
+    건너뛰고, 원장에 SELF_TRANSFER 거래가 생기지 않으며, 계좌 잔액이 음수가
+    되지 않는다(리뷰 U2 재현 방지)."""
+
+    profile = _profile_with_emergency(opening_balance=0, emergency_amt=5_000_000)
+    gen = Generator(profile, seed=1, months=1, end=date(2026, 9, 30))
+    gen.run()
+
+    primary = gen.accounts[10]
+    emer = gen.accounts[11]
+    self_transfers = [tx for tx in gen.transactions if tx.get("exclude_tag") == "SELF_TRANSFER"]
+
+    assert not self_transfers, "잔액 부족인데도 비상금 이체가 발생함(B6 회귀)"
+    assert emer.balance == 0
+    assert primary.balance >= 0
+
+
+# ---------------------------------------------------------------------------
 # profile_schema 검증 실패 케이스 (리뷰 N10)
 # ---------------------------------------------------------------------------
 

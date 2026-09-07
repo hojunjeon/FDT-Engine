@@ -6,9 +6,12 @@
 (a) `EngineResult` 스키마 자체(파싱 실패 = 오류). 이 과정에서 렌더러 종속
     키·값(color, px, 라이브러리명)도 `Viz` 모델의 `model_validator` 가 함께
     걸러낸다.
-(b) 모드별 필수 facts key 존재 + importance == 1.
+(b) 모드별 필수 facts key 존재 + importance == 1(§9.4 무조건 필수) +
+    조건부 필수(결과에 해당 데이터가 있을 때만 요구, N17).
 (c) 모드별 필수 viz kind 존재 + priority == 1.
-(d) viz annotations 라벨·caption 의 모든 숫자 토큰이 facts 표기 집합에 포함.
+(d) `title`·`caption`·`annotations[].label`·`data.*.{label,name,detail}`
+    의 모든 숫자 토큰이 facts 표기 집합과 **정확히 일치**(집합 대 집합
+    비교, B9/S59) - 서수·계수(1위/3개/2건/10번째)는 예외.
 (e) line_band x/y/band 길이 일치, step_bars 스택 합 == total(±1원),
     gauge thresholds 오름차순, table columns key ⊂ rows key.
 (f) status=ERROR 면 result/facts/viz 가 없어야 한다.
@@ -20,6 +23,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -57,7 +61,36 @@ MODE_REQUIRED_VIZ_KINDS: dict[Mode, tuple[str, ...]] = {
     Mode.OPTIMIZE: ("ranked_bars", "delta_bars"),
 }
 
+# N17: §9.4 는 몇몇 필수 facts 를 "결과에 그 데이터가 있을 때만" 요구한다
+# (FORECAST 소진 예상 봉투, RISK 최고 위험 결제, OPTIMIZE 1위 행동). 이전에는
+# `MODE_REQUIRED_FACTS` 가 이 3개를 아예 검사하지 않아 `facts.py` 가 회귀해도
+# 잡히지 않았다. 각 항목은 (조건 함수, 조건이 참일 때 요구하는 fact key 들)
+# 이다 - 조건 함수는 파싱된 모드별 result 를 받는다.
+MODE_CONDITIONAL_REQUIRED_FACTS: dict[Mode, tuple[tuple[Any, tuple[str, ...]], ...]] = {
+    Mode.FORECAST: (
+        (
+            lambda r: any(e.exhaust_date_median is not None for e in r.envelopes),
+            ("envelope_exhaust_date_1",),
+        ),
+    ),
+    Mode.RISK: (
+        (
+            lambda r: bool(r.payment_risks),
+            ("payment_risk_due_1", "payment_risk_amount_1", "payment_risk_fail_prob_1"),
+        ),
+    ),
+    Mode.OPTIMIZE: (
+        (lambda r: bool(r.ranked), ("top_action_label", "top_action_delta")),
+    ),
+}
+
 _NUMBER_TOKEN_RE = re.compile(r"[+-]?\d[\d,\.]*")
+
+# B9/S59: 서수·계수(1위, 3개, 2건, 10번째)는 오케스트레이터 결정으로 facts
+# 등록 대상에서 제외한다(§9.3 예외) - 그 숫자를 뺀 나머지만 정확 일치로
+# 검사한다. 이 정규식이 매치한 부분 문자열을 검사 대상 텍스트에서 먼저
+# 제거해 "1위" 의 "1" 이 facts 표기에 없어도 통과시킨다.
+_ORDINAL_COUNT_RE = re.compile(r"\d+(?:위|개|건|번째)")
 
 # 렌더러 종속 키(라이브러리명 6종)·값(hex 색상 코드, rgb(, Npx)은
 # `fdt.engine.schemas.result._VizBase._no_forbidden_keys` 모델 검증기가 이미
@@ -85,6 +118,17 @@ def _check_required_facts(result_obj: EngineResult, errors: list[str]) -> None:
         elif fact.importance != 1:
             errors.append(f"필수 fact {key} 의 importance 가 1 이 아니다 (mode={mode.value})")
 
+    # N17: 조건부 필수(결과에 해당 데이터가 있을 때만).
+    result = result_obj.result
+    if result is None:
+        return
+    for condition, keys in MODE_CONDITIONAL_REQUIRED_FACTS.get(mode, ()):
+        if not condition(result):
+            continue
+        for key in keys:
+            if key not in fact_by_key:
+                errors.append(f"필수 fact 누락(조건부): {key} (mode={mode.value})")
+
 
 def _check_required_viz(result_obj: EngineResult, errors: list[str]) -> None:
     mode = result_obj.meta.mode
@@ -94,25 +138,68 @@ def _check_required_viz(result_obj: EngineResult, errors: list[str]) -> None:
             errors.append(f"필수 viz 누락: {kind} (mode={mode.value}, priority=1)")
 
 
-def _check_caption_numbers(result_obj: EngineResult, errors: list[str]) -> None:
-    """annotations 라벨·caption 의 숫자 토큰이 facts 표기에 포함되는지 검사 (R7).
+def _normalize_number_token(token: str) -> str:
+    """쉼표를 제거해 "19100" 과 "19,100" 을 같은 토큰으로 본다(B9 거짓 양성 제거)."""
 
-    한국어 단위 결합 표기("1만 9천원" 등)도 포함해 부분 문자열 일치로
-    검사한다(SPEC 14 R7 지시). 토큰 하나가 facts 의 `allowed_renderings`
-    전체를 이어붙인 문자열 어딘가에 부분 문자열로 나타나면 통과시킨다.
+    return token.replace(",", "")
+
+
+def _number_token_set(text: str) -> set[str]:
+    stripped = _ORDINAL_COUNT_RE.sub(" ", text)
+    return {_normalize_number_token(tok) for tok in _NUMBER_TOKEN_RE.findall(stripped)}
+
+
+def _iter_named_strings(data: Any, path: str = "") -> list[tuple[str, str]]:
+    """`data`(viz.data 를 dict 로 덤프한 것)를 재귀 순회하며 key 가
+    label/name/detail 인 문자열 값을 전부 낸다 (B9/S59 검사 범위 확장:
+    `data.*.{label,name,detail}`)."""
+
+    out: list[tuple[str, str]] = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            sub_path = f"{path}.{key}" if path else str(key)
+            if key in ("label", "name", "detail") and isinstance(value, str):
+                out.append((sub_path, value))
+            else:
+                out.extend(_iter_named_strings(value, sub_path))
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            out.extend(_iter_named_strings(item, f"{path}[{i}]"))
+    return out
+
+
+def _check_caption_numbers(result_obj: EngineResult, errors: list[str]) -> None:
+    """`title`·`caption`·`annotations[].label`·`data.*.{label,name,detail}`
+    의 숫자 토큰이 facts 표기의 숫자 토큰 집합과 **정확히 일치**하는지
+    검사한다 (B9/S59).
+
+    이전에는 표기를 이어붙인 문자열에 `in` 으로 부분 문자열 검색을 했다 -
+    "37점" 의 "37" 이 "1,370,000원" 의 부분 문자열이라는 이유로 통과하는 등
+    검사가 사실상 무력화됐다(한 자리 숫자는 거의 항상 통과). 이제 양쪽을
+    각각 숫자 토큰 **집합**으로 만들어(쉼표 제거로 정규화) 정확히 포함되는지
+    본다. 순위·개수 같은 서수/계수(`_ORDINAL_COUNT_RE`)는 예외로 제외한다
+    (§9.3, "1위"/"3개"/"2건"/"10번째" 는 오케스트레이터가 정한 값이라 facts
+    에 넣지 않는다).
     """
 
-    blob = " ".join(r for f in result_obj.facts for r in f.allowed_renderings)
+    fact_tokens: set[str] = set()
+    for f in result_obj.facts:
+        for rendering in f.allowed_renderings:
+            fact_tokens.update(_number_token_set(rendering))
 
     def _check_text(source: str, where: str) -> None:
-        for token in _NUMBER_TOKEN_RE.findall(source):
-            if token not in blob:
+        for token in _number_token_set(source):
+            if token not in fact_tokens:
                 errors.append(f"{where} 의 숫자 '{token}' 가 facts 표기 집합에 없다: {source!r}")
 
     for v in result_obj.viz:
+        _check_text(v.title, f"viz {v.id} title")
         for ann in v.annotations:
             _check_text(ann.label, f"viz {v.id} annotation")
         _check_text(v.caption, f"viz {v.id} caption")
+        data_dump = v.data.model_dump(mode="json") if hasattr(v.data, "model_dump") else {}
+        for field_path, text in _iter_named_strings(data_dump):
+            _check_text(text, f"viz {v.id} data.{field_path}")
 
 
 def _check_structure(result_obj: EngineResult, errors: list[str]) -> None:
@@ -185,4 +272,10 @@ def validate_result(obj: dict | EngineResult) -> ValidationReport:
     return ValidationReport(ok=not errors, errors=errors, warnings=warnings)
 
 
-__all__ = ["MODE_REQUIRED_FACTS", "MODE_REQUIRED_VIZ_KINDS", "ValidationReport", "validate_result"]
+__all__ = [
+    "MODE_CONDITIONAL_REQUIRED_FACTS",
+    "MODE_REQUIRED_FACTS",
+    "MODE_REQUIRED_VIZ_KINDS",
+    "ValidationReport",
+    "validate_result",
+]

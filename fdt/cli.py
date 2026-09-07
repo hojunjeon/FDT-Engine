@@ -1,7 +1,8 @@
 """FDT 테스트용 CLI (SPEC 10장).
 
-`schema`, `gen` 에 이어 이번 단계(W5)는 `build`, `inspect`, `run` 골격을
-더한다. `render`/`validate` 는 이후 다른 작업자(W12)가 추가한다.
+`schema`, `gen`, `build`, `inspect`, `run` 에 이어 `validate`(독립 서브커맨드)
+와 `render`(viz -> PNG, 개발·QA 전용)를 더해 SPEC 10장의 7개 서브커맨드가
+모두 갖춰졌다.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from fdt.engine.schemas.request import ModeRequest
 from fdt.engine.taxonomy import ENVELOPE_IDS
 from fdt.gen import DEFAULT_END, DEFAULT_MONTHS, PROFILE_NAMES, write_profile
 from fdt.tools.engine_io import load_engine, save_engine
+from fdt.tools.render import render_result
 from fdt.tools.schema_export import export_json_schemas
 from fdt.tools.validate import validate_result
 
@@ -383,6 +385,60 @@ def run_mode(
             typer.echo("validate: ok")
 
         typer.echo(f"wrote {out}")
+
+
+@app.command()
+def validate(
+    result: Path = typer.Option(..., "--result", help="EngineResult JSON 경로"),  # noqa: B008
+) -> None:
+    """`EngineResult` JSON 을 읽어 `fdt/tools/validate.py` 로 검사한다 (SPEC 10장).
+
+    스키마·필수 facts/viz·annotations·caption 숫자(§9.3 R7) 등을 검사하고
+    오류 목록을 출력한다. 통과하면 종료 코드 0, 실패하면(또는 파일을 읽거나
+    파싱할 수 없으면) 종료 코드 1.
+    """
+
+    with _cli_error_guard():
+        try:
+            result_text = result.read_text(encoding="utf-8")
+        except OSError as exc:
+            _echo_error(E_REQ_INVALID, f"결과 파일을 읽을 수 없다: {result} ({exc})")
+            raise typer.Exit(code=1) from exc
+
+        try:
+            result_raw = json.loads(result_text)
+        except json.JSONDecodeError as exc:
+            _echo_error(E_REQ_INVALID, f"결과 JSON 파싱 실패: {exc}")
+            raise typer.Exit(code=1) from exc
+
+        report = validate_result(result_raw)
+        for warning in report.warnings:
+            typer.echo(f"warning: {warning}")
+        if not report.ok:
+            for err in report.errors:
+                typer.echo(f"error: {err}")
+            typer.echo(f"validate {result}: FAIL ({len(report.errors)}건)")
+            raise typer.Exit(code=1)
+        typer.echo(f"validate {result}: OK")
+
+
+@app.command()
+def render(
+    result: Path = typer.Option(..., "--result", help="EngineResult JSON 경로"),  # noqa: B008
+    out: Path = typer.Option(..., "--out", help="PNG 를 쓸 디렉터리"),  # noqa: B008
+) -> None:
+    """`EngineResult` 의 viz 8종을 PNG 로 그린다 (SPEC 10장, §6.3 - 개발·QA 전용).
+
+    `fdt/tools/render.py::render_result` 를 그대로 호출한다. `matplotlib` 로
+    그리며, 렌더러 독립이어야 하는 `fdt/engine/**` 는 이 커맨드가 부르지
+    않는다(`viz` 명세는 이미 `result` JSON 안에 들어있다).
+    """
+
+    with _cli_error_guard():
+        written = render_result(result, out)
+        for path in written:
+            typer.echo(f"wrote {path}")
+        typer.echo(f"{len(written)} PNG file(s) written to {out}")
 
 
 if __name__ == "__main__":

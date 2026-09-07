@@ -10,21 +10,40 @@ CRN 을 지킨다.
    범위를 벗어나면 이 러너가 직접 `FdtError(E-REQ-RANGE)` 를 던진다(작업
    지시 "러너에서 검사").
 2. 기준 시뮬 `base = run_sim(make_context(engine, req, horizon_days=H))` ->
-   `achieve_prob`(goal_type 별 지표, 아래 `_achieve_prob` 참조).
+   `achieve_prob`(goal_type 별 지표, 아래 `_achieve_prob`/
+   `_envelope_adhere_achieve_prob` 참조).
 3. 확정 유입 `I`(수입 일정 재사용, 아래 `_confirmed_income` - `state.income`
    의 이미 추정된 일정만 읽고 Behavior 의 수입 추정 자체를 다시 하지
-   않는다), 확정 유출 `F`(약정 큐 합, `_confirmed_outflow`).
+   않는다), 확정 유출 `F`(약정 큐 합(`CARD_BILL` 제외) + 카드 상태 기반
+   합 - `_confirmed_outflow` + `_card_confirmed_outflow`, 리뷰 N9/S44).
 4. `available`, `baseline_discretionary`(기준 시뮬의 봉투 지출 합 중앙값,
    월 경계 리셋을 되짚어 H 기간 전체 누적으로 복원 - `_cumulative_envelope_totals`),
    `reduction_ratio`(`[0,1]` 로 클립 - available<0 이면 1.0, available>=baseline
-   이면 0.0), `required`.
+   이면 0.0), `required.total_discretionary_cap`(세 겹 클램프: `available`,
+   `baseline_discretionary`, `Σ현재 확정 예산 x H/30` 중 최솟값 - 리뷰
+   블로커 B5(i), SPEC 제안 S55. 예전에는 두 겹만 클램프해 `available >=
+   baseline` 인 주에 상한이 확정 예산을 넘어서(D 프로필 실측 830,000원/월
+   ->1,249,160원/월) `plan_achieve_prob` 이 역행했다).
 5. 주차 분할과 봉투 배분(`_build_weekly_caps`) - 필수 봉투 하한을 항상
    보장하고(협상 불가 보호), 하한 합이 그 주의 재량 한도를 넘으면 필수만
    채우고 유연은 0 으로 낮춘다(그 주 실제 total_cap 이 하한 합으로
    올라간다 - "협상 불가" 보호가 상한 예산 자체보다 우선한다는 뜻이다).
-6. 주차 상한을 봉투별 월 예산으로 환산(`cap 합 x 30 / H`, 아래
-   `_weekly_caps_to_monthly_budgets` 참조)해 `Overrides.budgets` 로 실제
-   재시뮬 -> `plan_achieve_prob`.
+6. 주차 상한을 봉투별 월 단위 **하드 캡**으로 환산(`cap 합 x 30 / H`, 아래
+   `_weekly_caps_to_monthly_hard_caps` 참조)해 `Overrides.hard_caps`(J1,
+   SPEC 제안 S55)로 실제 재시뮬 -> `plan_achieve_prob`. 예전에는 소프트
+   `Overrides.budgets`(elasticity_gate 문턱만 바꾼다)를 썼는데, 그 문턱을
+   올리면 소비가 오히려 늘어나 "절약 계획" 이 달성 확률을 역행시키는
+   결함이 있었다(리뷰 블로커 B5) - `hard_caps` 는 진짜 상한이라 이 문제가
+   구조적으로 재발하지 않는다.
+
+ENVELOPE_ADHERE 의 `achieve_prob`/`plan_achieve_prob` 은 봉투별 잔여의
+**합**이 아니라 **전 봉투 AND**(그 시점에 모든 봉투가 각자 예산 이내)로
+잰다(`_envelope_adhere_achieve_prob`, `_common.envelope_adherence_mask` 공용
+- `optimize.py` 의 `REACH_GOAL(ENVELOPE_ADHERE)` 분기와 같은 규칙이다,
+리뷰 블로커 B5). 합으로 재면 한 봉투의 여유가 다른 봉투의 초과를 상쇄해
+버려 SPEC 8.4 "이번 달 **전 봉투** 예산 내" 를 재는 지표가 될 수 없다.
+`_goal_indicator` 가 반환하는 "봉투별 잔여 합" 배열은 `gap` 계산에만 계속
+쓴다.
 
 ENVELOPE_ADHERE 는 `target_amount`/`target_date` 가 없다(SPEC 8.4 표). 이
 러너는 그 경우 `target_date = state.cycle.budget_cycle_end`, 내부 계산용
@@ -35,17 +54,17 @@ ENVELOPE_ADHERE 는 `target_amount`/`target_date` 가 없다(SPEC 8.4 표). 이
 
 from __future__ import annotations
 
-import calendar
 from datetime import date, timedelta
 
 import numpy as np
 
+from fdt.engine._dateutil import add_months
 from fdt.engine.errors import E_REQ_RANGE, FdtError
 from fdt.engine.modes import register
-from fdt.engine.modes._common import make_context, run_sim, to_int
+from fdt.engine.modes._common import envelope_adherence_mask, make_context, run_sim, to_int
 from fdt.engine.schemas.request import GoalParams, ModeRequest
 from fdt.engine.schemas.result import EnvelopeCap, Gap, GoalResult, Required, WeeklyCap
-from fdt.engine.schemas.state import Committed, IncomeSchedule, State
+from fdt.engine.schemas.state import CardState, Committed, IncomeSchedule, State
 from fdt.engine.simulate import Overrides, SimulationResult
 from fdt.engine.taxonomy import ENVELOPE_IDS, Mode
 
@@ -75,17 +94,6 @@ def _clip(value: float, lo: float, hi: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _add_month(year: int, month: int) -> tuple[int, int]:
-    if month == 12:
-        return year + 1, 1
-    return year, month + 1
-
-
-def _clamped_month_date(year: int, month: int, day: int) -> date:
-    last_day = calendar.monthrange(year, month)[1]
-    return date(year, month, min(day, last_day))
-
-
 def _confirmed_income(income: IncomeSchedule, as_of: date, target_date: date) -> int:
     """확정 유입 `I` (SPEC 8.4: "규칙적이면 H 안 수입 횟수 x expected(as_of
     이후 next_date 부터 매월 같은 일자, 말일 보정), 불규칙 expected x
@@ -93,12 +101,11 @@ def _confirmed_income(income: IncomeSchedule, as_of: date, target_date: date) ->
 
     `state.income`(Behavior 가 이미 추정한 일정)만 읽는다 - 수입 일정
     추정(§6.6) 자체를 다시 하지 않는다(작업 지시 금지 사항 "수입 일정·큐
-    계산 중복 구현"). 월 진행만 여기서 다시 계산하는 이유는 `simulate()`
-    의 같은 로직(`_clamped_month_date`/`_add_month`)이 private 이라 모듈
-    간에 가져오지 않는 관례를 따르기 때문이다(risk.py:33-39 주석과 같은
-    패턴) - 이 두 함수는 SPEC 문구("매월 같은 일자, 말일 보정")를 그대로
-    코드로 옮긴 것이지 시뮬레이터의 확률적 진행 로직(수입 잡음, 카드 청구
-    등)을 복제한 게 아니다.
+    계산 중복 구현"). 월 진행은 공용 `fdt.engine._dateutil.add_months`
+    (리뷰 N10: 이전에는 `simulate.py`/`state.py` 와 각각 사본을 들고
+    있었다)로 계산한다 - `income.next_date` 를 고정 앵커로 `add_months`
+    를 반복 호출하므로("매월 같은 일자, 말일 보정") 앵커 일자가 절대
+    드리프트하지 않는다(`add_months` docstring 참조).
     """
 
     if income.next_date is None:
@@ -111,25 +118,50 @@ def _confirmed_income(income: IncomeSchedule, as_of: date, target_date: date) ->
         occurrences = horizon / income.median_gap_days
         return round(income.expected * occurrences * _IRREGULAR_INCOME_FACTOR)
 
-    anchor_day = income.next_date.day
     count = 0
+    k = 0
     d: date | None = income.next_date
     while d is not None and d <= target_date:
         count += 1
-        year, month = _add_month(d.year, d.month)
-        d = _clamped_month_date(year, month, anchor_day)
+        k += 1
+        d = add_months(income.next_date, k)
     return count * income.expected
+
+
+def _card_confirmed_outflow(cards: list[CardState]) -> int:
+    """카드대금(미청구 `unbilled` + 미결제 `issued_unpaid`) 총액 (리뷰 N9,
+    SPEC 제안 S44).
+
+    약정 큐의 `CARD_BILL` 항목은 `simulate()` 가 이중 반영을 피하려고
+    무시하고 카드 상태에서 청구를 직접 재구성하는 것과 같은 정보다
+    (`state.py` 의 `unbilled`/`issued_unpaid` 가 정본, S44). 이전에는
+    `_confirmed_outflow` 가 큐의 `CARD_BILL` 을 필터 없이 그대로 더해
+    `simulate` 와 다른 원천을 읽었다(같은 큐를 두 코드가 다르게 읽는 문제,
+    `available` 과소 추정 -> `reduction_ratio` 과대). 이 함수가 카드 상태
+    기반 값을 **한 번만** 계상하도록 대체한다.
+    """
+
+    total = 0
+    for card in cards:
+        total += card.unbilled
+        total += sum(billing.amount for billing in card.issued_unpaid)
+    return total
 
 
 def _confirmed_outflow(committed: list[Committed], as_of: date, target_date: date) -> int:
     """확정 유출 `F` (SPEC 8.4: "큐 + 월 반복", 본문 "큐(H+7 재생성) amount
-    합(카드대금 미청구·미결제, SELF_TRANSFER 포함)"). 카드대금 미청구·
-    미결제·SELF_TRANSFER 는 이미 약정 큐 항목이므로(SPEC 5.4, `state.py`
-    `_card_queue_items`/`_detected_self_transfer_queue_items`) 따로 더하지
-    않는다 - 여기서 다시 계산하면 중복이다.
+    합(SELF_TRANSFER 포함)"). `kind == "CARD_BILL"` 항목은 제외한다(리뷰
+    N9/S44) - 그 금액은 `_card_confirmed_outflow` 가 카드 상태에서 직접
+    계상하므로, 여기서 큐 항목까지 더하면 이중 계상이 아니라 **다른 값**을
+    두 번 세는 것이다(큐는 as_of 스냅샷, 카드 상태는 `simulate` 가 실제로
+    읽는 정본).
     """
 
-    return sum(item.amount for item in committed if as_of < item.due <= target_date)
+    return sum(
+        item.amount
+        for item in committed
+        if as_of < item.due <= target_date and item.kind != "CARD_BILL"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -171,19 +203,26 @@ def _cumulative_envelope_totals(sim: SimulationResult) -> dict[int, np.ndarray]:
 def _goal_indicator(
     goal_type: str, sim: SimulationResult, state: State
 ) -> np.ndarray:
-    """goal_type 별 "경로 지표" 배열(path 축, 실수) - `achieve_prob`/`gap`
-    양쪽이 이 배열에서 나온다(같은 지표를 두 곳에서 따로 계산하지 않는다).
+    """goal_type 별 "경로 지표" 배열(path 축, 실수) - `gap` 이 이 배열에서
+    나온다. `achieve_prob`/`plan_achieve_prob` 은 BALANCE/SAVE 만 이 배열을
+    그대로 쓰고, ENVELOPE_ADHERE 는 `_envelope_adhere_achieve_prob`(AND
+    마스크, 아래 참조)을 따로 쓴다 - 봉투별 잔여의 **합** 은 한 봉투의
+    여유가 다른 봉투의 초과를 상쇄해 버려 "전 봉투 예산 내" 를 재는 지표가
+    될 수 없기 때문이다(리뷰 블로커 B5). 이 배열은 ENVELOPE_ADHERE 의
+    `gap`(연속값이 필요한 보조 지표) 용으로만 계속 쓴다.
     """
 
     if goal_type == "BALANCE":
         return sim.balances[:, -1].astype(np.float64)
     if goal_type == "SAVE":
-        return (sim.balances[:, -1] - sim.balances[:, 0]).astype(np.float64)
+        # M2 확정: PRIMARY 잔액 증가분이되, **경제 잔액**(청구서 미납·억제
+        # 수요까지 반영) 기준으로 잰다(리뷰 N8) - `balances` 기준이면
+        # 카드 미결제 청구서가 쌓인 경로에서 "저축했다" 로 과대 계상된다.
+        return (sim.economic[:, -1] - sim.economic[:, 0]).astype(np.float64)
 
-    # ENVELOPE_ADHERE: 봉투별 (budget - spent) 합 - 양수면 전 봉투가 예산
-    # 안에 있다는 뜻이므로 목표치 0 과 비교한다(모듈 docstring 참조, H 가
-    # 이번 달 말일까지라 월 경계 리셋이 없어 `envelope_spend[:, :, -1]` 을
-    # 그대로 써도 된다).
+    # ENVELOPE_ADHERE: 봉투별 (budget - spent) 합 - `gap` 보조 지표용으로만
+    # 남긴다(위 docstring 참조, H 가 이번 달 말일까지라 월 경계 리셋이 없어
+    # `envelope_spend[:, :, -1]` 을 그대로 써도 된다).
     budget_by_id = {e.envelope_id: e.budget for e in state.envelopes}
     remaining = np.zeros(sim.envelope_spend.shape[0], dtype=np.float64)
     for i, eid in enumerate(sim.envelope_ids):
@@ -195,6 +234,17 @@ def _achieve_prob(goal_type: str, indicator: np.ndarray, target_amount: int) -> 
     if indicator.size == 0:
         return 0.0
     return float(np.mean(indicator >= target_amount))
+
+
+def _envelope_adhere_achieve_prob(sim: SimulationResult, state: State, idx: int) -> float:
+    """ENVELOPE_ADHERE 의 진짜 지표: 그 시점에 **전 봉투가 AND** 로 각자
+    예산 이내인 경로 비율(리뷰 블로커 B5, `optimize.py` 의
+    `REACH_GOAL(ENVELOPE_ADHERE)` 분기와 같은 규칙을 `_common.
+    envelope_adherence_mask` 로 공용화한 것)."""
+
+    budgets = {e.envelope_id: e.budget for e in state.envelopes}
+    mask = envelope_adherence_mask(sim, budgets, idx)
+    return float(mask.mean()) if mask.size else 0.0
 
 
 def _gap(indicator: np.ndarray, target_amount: int) -> Gap:
@@ -365,13 +415,24 @@ def _build_weekly_caps(
     return weekly_caps, any_essential_only
 
 
-def _weekly_caps_to_monthly_budgets(
+def _weekly_caps_to_monthly_hard_caps(
     weekly_caps: list[WeeklyCap], horizon_days: int
 ) -> dict[int, int]:
-    """주차 cap -> 월 예산 환산(`Overrides.budgets`, SPEC 8.4 "상한을 실제
-    주입해 재시뮬"). 환산 규칙(SPEC 이 권장하는 대로): 봉투별 H 기간 총
-    cap x 30/H - `simulate()` 의 `budget_arr` 은 "월 예산" 단위이므로(SPEC
-    5.5), H 일 동안 쓰라고 배분한 총액을 30일 기준 월 예산으로 스케일한다.
+    """주차 cap -> 월 단위 하드 캡 환산(`Overrides.hard_caps`, SPEC 8.4
+    "상한을 실제 주입해 재시뮬", 리뷰 블로커 B5 + SPEC 제안 S55).
+
+    이전에는 `Overrides.budgets`(소프트, elasticity_gate 문턱만 바꾼다)로
+    재시뮬했다 - `available >= baseline_discretionary` 인 주(reduction_
+    ratio=0)에서 이 환산값이 확정 예산보다 커지면 예산"인상"이 되어 gate
+    문턱이 낮아지고(remaining_ratio 가 0.2 밑으로 안 내려가) 오히려 소비가
+    **늘어**(`plan_achieve_prob` 역행 2/10 실측, W9/B5) 버렸다. `Overrides.
+    hard_caps` 는 진짜 상한(그 달 누적 체결분이 캡에 닿으면 λ->0)이라 캡이
+    확정 예산보다 크더라도 기준 행동 이상으로 소비를 늘리지 않는다 -
+    구조적으로 이 회귀가 재발할 수 없다.
+
+    환산 규칙은 그대로다: 봉투별 H 기간 총 cap x 30/H - `hard_caps` 도
+    `budgets` 와 같은 "월 누적" 단위이므로(J1 `Overrides.hard_caps`
+    docstring), H 일 동안 쓰라고 배분한 총액을 30일 기준으로 스케일한다.
     """
 
     totals: dict[int, int] = {}
@@ -414,15 +475,22 @@ def run_goal(engine, req: ModeRequest) -> GoalResult:
     base_sim = run_sim(ctx)
 
     indicator = _goal_indicator(params.goal_type, base_sim, state)
-    achieve_prob = _achieve_prob(params.goal_type, indicator, target_amount)
     gap = _gap(indicator, target_amount)
+    if params.goal_type == "ENVELOPE_ADHERE":
+        # AND 마스크(리뷰 블로커 B5) - `indicator`(봉투별 잔여의 합)는
+        # `gap` 보조 지표로만 쓴다.
+        achieve_prob = _envelope_adhere_achieve_prob(base_sim, state, horizon_days)
+    else:
+        achieve_prob = _achieve_prob(params.goal_type, indicator, target_amount)
 
     notes: list[str] = []
     if state.income.irregular:
         notes.append("불규칙 수입은 기대치의 80%만 반영")
 
     confirmed_income = _confirmed_income(state.income, as_of, target_date)
-    confirmed_outflow = _confirmed_outflow(ctx.committed, as_of, target_date)
+    confirmed_outflow = _confirmed_outflow(ctx.committed, as_of, target_date) + (
+        _card_confirmed_outflow(state.cards)
+    )
 
     if params.goal_type == "SAVE":
         available = confirmed_income - confirmed_outflow - target_amount
@@ -441,7 +509,16 @@ def run_goal(engine, req: ModeRequest) -> GoalResult:
         reduction_ratio = _clip(1.0 - available / baseline_discretionary, 0.0, 1.0)
     else:
         reduction_ratio = 0.0
-    total_discretionary_cap = to_int(baseline_discretionary * (1.0 - reduction_ratio))
+
+    # 세 겹 클램프(리뷰 블로커 B5(i), SPEC 제안 S55): available/baseline 로
+    # 유도한 상한이 "현재 확정 예산의 H 기간 총액"을 넘을 수 없다 - 예전에는
+    # `available >= baseline_discretionary` 인 주에 이 상한이 확정 예산(D
+    # 프로필 실측 830,000원/월)의 1.5배(1,249,160원/월)까지 치솟았다.
+    current_budget_total_h = sum(e.budget for e in state.envelopes) * horizon_days / _MONTH_DAYS
+    capped_by_available = baseline_discretionary * (1.0 - reduction_ratio)
+    total_discretionary_cap = to_int(
+        max(0.0, min(capped_by_available, current_budget_total_h))
+    )
 
     weekly_caps, essential_only_hit = _build_weekly_caps(
         horizon_days,
@@ -455,10 +532,13 @@ def run_goal(engine, req: ModeRequest) -> GoalResult:
     if essential_only_hit:
         notes.append("필수 봉투 하한 보장을 위해 일부 주차의 유연 봉투 지출 한도를 0으로 낮췄다")
 
-    monthly_budgets = _weekly_caps_to_monthly_budgets(weekly_caps, horizon_days)
-    plan_sim = run_sim(ctx, overrides=Overrides(budgets=monthly_budgets))
-    plan_indicator = _goal_indicator(params.goal_type, plan_sim, state)
-    plan_achieve_prob = _achieve_prob(params.goal_type, plan_indicator, target_amount)
+    monthly_hard_caps = _weekly_caps_to_monthly_hard_caps(weekly_caps, horizon_days)
+    plan_sim = run_sim(ctx, overrides=Overrides(hard_caps=monthly_hard_caps))
+    if params.goal_type == "ENVELOPE_ADHERE":
+        plan_achieve_prob = _envelope_adhere_achieve_prob(plan_sim, state, horizon_days)
+    else:
+        plan_indicator = _goal_indicator(params.goal_type, plan_sim, state)
+        plan_achieve_prob = _achieve_prob(params.goal_type, plan_indicator, target_amount)
 
     return GoalResult(
         feasible=feasible,

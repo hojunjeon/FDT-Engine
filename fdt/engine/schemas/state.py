@@ -38,6 +38,11 @@ class CardState(_Base):
     withdrawal_weekday: int = Field(ge=0, le=6)
     withdrawal_account_id: int  # S33: 청구 발행/카드 출금 단계에서 큐에 없는
     # 새 청구서를 만들 때도 출금 계좌를 알아야 하므로 twin.cards 에서 옮겨온다.
+    card_name: str = ""  # S47: 시뮬레이터가 큐 없이(카드 자체 로직으로) 청구
+    # 이벤트를 만들 때 사람이 읽는 이름이 필요하다(`withdrawal_account_id` 를
+    # 옮긴 것과 같은 이유). `engine/state.py._build_cards` 가 twin.cards 에서
+    # 채운다. 기본값은 다른 파일이 이 필드를 모르고 만드는 수작업 CardState 를
+    # 깨지 않기 위한 하위 호환용이다.
     unbilled: int
     issued_unpaid: list[IssuedBilling] = Field(default_factory=list)
 
@@ -73,6 +78,17 @@ class Committed(_Base):
     source_fixed_expense_id: int | None = None
     source_loan_id: int | None = None
     source_card_id: int | None = None
+    # B4: `EXTERNAL.loan_rate_delta_bp` 주입이 대출이자 항목의 금액에 실제
+    # 영향을 주려면 시뮬레이터가 rate 를 다시 계산해야 하는데, 큐 항목은
+    # build 시점에 이미 확정된 `amount` 만 갖고 있었다(리뷰 B4). `kind ==
+    # "LOAN"` 항목만 이 세 필드를 채운다(`engine/state.py._loan_queue_items`).
+    # `loan_repayment == "AMORTIZING"` 이면 시뮬레이터는 재계산하지 않는다
+    # (원리금균등상환은 `term_months` 가정을 다시 풀어야 해서 `rate_pct`/
+    # `principal` 만으로는 정확한 재계산이 불가능하다 - `simulate.py` 의
+    # 해당 분기 docstring 에 이 한계를 명시한다).
+    rate_pct: float | None = None
+    principal: int | None = None
+    loan_repayment: Literal["INTEREST_ONLY", "AMORTIZING"] | None = None
 
 
 # ---------------------------------------------------------------------------

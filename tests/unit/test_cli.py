@@ -336,3 +336,73 @@ def test_run_horizon_and_n_paths_out_of_range_reports_both_errors(tmp_path: Path
     assert len(errors) == 2
     assert {e["code"] for e in errors} == {"E-REQ-RANGE"}
     assert not result_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# `fdt validate` / `fdt render` (SPEC 10장, PLAN Phase 6 - 이전에는 미구현)
+# ---------------------------------------------------------------------------
+
+
+def _run_forecast(tmp_path: Path, name: str = "out.json") -> Path:
+    engine_path = _build_engine(tmp_path)
+    result_path = tmp_path / name
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--engine",
+            str(engine_path),
+            "--mode",
+            "FORECAST",
+            "--horizon",
+            "30",
+            "--out",
+            str(result_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return result_path
+
+
+def test_validate_subcommand_passes_for_ok_result(tmp_path: Path) -> None:
+    result_path = _run_forecast(tmp_path)
+
+    validate_result_cli = runner.invoke(app, ["validate", "--result", str(result_path)])
+
+    assert validate_result_cli.exit_code == 0, validate_result_cli.output
+    assert "OK" in validate_result_cli.output
+
+
+def test_validate_subcommand_fails_on_tampered_caption(tmp_path: Path) -> None:
+    result_path = _run_forecast(tmp_path)
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["viz"][0]["caption"] = "부족 확률은 999%다."
+    result_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    validate_result_cli = runner.invoke(app, ["validate", "--result", str(result_path)])
+
+    assert validate_result_cli.exit_code == 1, validate_result_cli.output
+    assert "999" in validate_result_cli.output
+
+
+def test_validate_subcommand_missing_file_reports_error(tmp_path: Path) -> None:
+    missing = tmp_path / "does_not_exist.json"
+
+    result = runner.invoke(app, ["validate", "--result", str(missing)])
+
+    assert result.exit_code == 1, result.output
+
+
+def test_render_subcommand_writes_png_files(tmp_path: Path) -> None:
+    result_path = _run_forecast(tmp_path)
+    out_dir = tmp_path / "png"
+
+    render_result_cli = runner.invoke(
+        app, ["render", "--result", str(result_path), "--out", str(out_dir)]
+    )
+
+    assert render_result_cli.exit_code == 0, render_result_cli.output
+    pngs = list(out_dir.glob("*.png"))
+    assert pngs, "PNG 파일이 하나도 안 만들어졌다"
+    for png in pngs:
+        assert png.stat().st_size > 0

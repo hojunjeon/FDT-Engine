@@ -44,8 +44,8 @@ def _fact_renderings(mode: Mode, result) -> set[str]:
 @pytest.mark.parametrize("mode", list(Mode))
 def test_required_viz_kinds_present_with_priority_1(mode: Mode):
     result = RESULT_BUILDERS[mode]()
-    facts = build_facts(mode, result, as_of=AS_OF)
-    viz = build_viz(mode, result, facts, as_of=AS_OF)
+    facts = build_facts(mode, result, as_of=AS_OF)  # type: ignore[arg-type]
+    viz = build_viz(mode, result, facts, as_of=AS_OF)  # type: ignore[arg-type]
     priority1_kinds = {v.kind for v in viz if v.priority == 1}
     assert REQUIRED_VIZ_KINDS[mode] <= priority1_kinds
 
@@ -55,8 +55,8 @@ def test_annotation_and_caption_numbers_are_subset_of_facts(mode: Mode):
     import re
 
     result = RESULT_BUILDERS[mode]()
-    facts = build_facts(mode, result, as_of=AS_OF)
-    viz = build_viz(mode, result, facts, as_of=AS_OF)
+    facts = build_facts(mode, result, as_of=AS_OF)  # type: ignore[arg-type]
+    viz = build_viz(mode, result, facts, as_of=AS_OF)  # type: ignore[arg-type]
     blob = " ".join(_fact_renderings(mode, result))
     token_re = re.compile(r"[+-]?\d[\d,\.]*")
     for v in viz:
@@ -145,6 +145,90 @@ def test_no_forbidden_library_names_or_color_codes_anywhere():
                 assert banned not in blob.lower(), f"{mode}:{v.id} 에 라이브러리명 '{banned}' 발견"
             assert not hex_re.search(blob), f"{mode}:{v.id} 에 hex 색상 코드가 있다"
             assert not px_re.search(blob), f"{mode}:{v.id} 에 px 값이 있다"
+
+
+def test_optimize_combo_label_joins_all_actions():
+    """B8 회귀: 조합(2개 이상 행동) 후보의 `ranked_bars` 라벨이
+    `ra.actions[0].label` 만 읽으면 1위와 같은 라벨로 붕괴한다 - "; " 로
+    이어붙여야 한다."""
+
+    from fdt.engine.schemas.result import AppliedAction, RankedAction
+
+    result = _optimize_result()
+    combo = RankedAction(
+        rank=3,
+        actions=[
+            AppliedAction(
+                injection={  # type: ignore[arg-type]
+                    "type": "BUDGET_CHANGE",
+                    "envelope_id": 1,
+                    "new_budget": 100000,
+                    "behavior_follows": True,
+                },
+                label="외식 예산 20% 축소",
+            ),
+            AppliedAction(
+                injection={  # type: ignore[arg-type]
+                    "type": "FIXED_CHANGE",
+                    "fixed_expense_id": 9,
+                    "cancel": True,
+                    "from": "2026-09-08",
+                },
+                label="구독 해지",
+            ),
+        ],
+        effect={"shortfall_prob": 0.25, "delta": -0.06, "end_balance_median": 850000},
+    )
+    result = result.model_copy(update={"ranked": [*result.ranked, combo]})
+
+    facts = build_facts(Mode.OPTIMIZE, result, as_of=AS_OF)
+    viz = build_viz(Mode.OPTIMIZE, result, facts, as_of=AS_OF)
+    ranked_bars = next(v for v in viz if v.kind == "ranked_bars")
+    combo_item = next(it for it in ranked_bars.data.items if it.rank == 3)
+    assert combo_item.label == "외식 예산 20% 축소; 구독 해지"
+
+
+def test_optimize_ranked_bars_detail_does_not_leak_feasibility_note():
+    """B8/항목 7-1: `feasibility_note` 의 미등록 금액이 `detail` 로 새면 안
+    된다 - 렌더러에는 빈 문자열만 넘긴다."""
+
+    result = _optimize_result()
+    facts = build_facts(Mode.OPTIMIZE, result, as_of=AS_OF)
+    viz = build_viz(Mode.OPTIMIZE, result, facts, as_of=AS_OF)
+    ranked_bars = next(v for v in viz if v.kind == "ranked_bars")
+    for item in ranked_bars.data.items:
+        assert item.detail == ""
+
+
+def test_goal_line_band_has_target_hline_annotation():
+    """SPEC 9.4: GOAL line_band 는 "목표선 hline" 이 있어야 한다(N16)."""
+
+    result = _goal_result()
+    facts = build_facts(Mode.GOAL, result, as_of=AS_OF)
+    viz = build_viz(Mode.GOAL, result, facts, as_of=AS_OF)
+    line_band = next(v for v in viz if v.kind == "line_band" and v.id == "goal_cap_trajectory")
+    hlines = [a for a in line_band.annotations if a.type == "hline"]
+    assert hlines, "GOAL line_band 에 목표선 hline annotation 이 없다"
+    assert hlines[0].y == result.required.total_discretionary_cap
+
+
+def test_risk_gauge_title_uses_horizon_days_when_given():
+    """S58: RISK gauge 제목의 "30일" 하드코딩 제거 - `horizon_days` 를 받으면
+    그 값을 쓰고, 안 받으면 숫자 없는 제목으로 낮춘다."""
+
+    result = _risk_result()
+    facts_with_horizon = build_facts(Mode.RISK, result, as_of=AS_OF, horizon_days=60)
+    viz_with_horizon = build_viz(
+        Mode.RISK, result, facts_with_horizon, as_of=AS_OF, horizon_days=60
+    )
+    gauge = next(v for v in viz_with_horizon if v.kind == "gauge")
+    assert gauge.title == "60일 결제 부족 위험"
+
+    facts_no_horizon = build_facts(Mode.RISK, result, as_of=AS_OF)
+    viz_no_horizon = build_viz(Mode.RISK, result, facts_no_horizon, as_of=AS_OF)
+    gauge_no_horizon = next(v for v in viz_no_horizon if v.kind == "gauge")
+    assert "일" not in gauge_no_horizon.title
+    assert gauge_no_horizon.title == "결제 부족 위험"
 
 
 def test_engine_result_ok_round_trips_for_all_modes():

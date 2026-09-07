@@ -242,7 +242,7 @@ def _optimize_result() -> OptimizeResult:
                 rank=1,
                 actions=[
                     AppliedAction(
-                        injection={
+                        injection={  # type: ignore[arg-type]
                             "type": "BUDGET_CHANGE",
                             "envelope_id": 5,
                             "new_budget": 280000,
@@ -264,7 +264,7 @@ def _optimize_result() -> OptimizeResult:
                 rank=2,
                 actions=[
                     AppliedAction(
-                        injection={
+                        injection={  # type: ignore[arg-type]
                             "type": "FIXED_CHANGE",
                             "fixed_expense_id": 3,
                             "cancel": True,
@@ -279,6 +279,7 @@ def _optimize_result() -> OptimizeResult:
         recommended=None,
         evaluated=23,
         sim_calls=24,
+        n_paths_used=200,
     )
 
 
@@ -303,7 +304,7 @@ def _request(mode: Mode) -> ModeRequest:
     elif mode is Mode.WHATIF:
         params = WhatIfParams(
             injections=[
-                {
+                {  # type: ignore[list-item]
                     "type": "SPEND",
                     "days_from_now": 1,
                     "amount": 150000,
@@ -313,7 +314,11 @@ def _request(mode: Mode) -> ModeRequest:
             ]
         )
     elif mode is Mode.GOAL:
-        params = GoalParams(goal_type="BALANCE", target_amount=2000000, target_date="2026-12-31")
+        params = GoalParams(
+            goal_type="BALANCE",
+            target_amount=2000000,
+            target_date="2026-12-31",  # type: ignore[arg-type]
+        )
     elif mode is Mode.RISK:
         params = RiskParams()
     else:
@@ -374,6 +379,23 @@ def test_krw_renderings_100man_and_above():
 
 def test_krw_renderings_zero():
     assert renderings_for(0, "KRW", -2) == ["0원"]
+
+
+def test_krw_renderings_under_1000_is_won_only():
+    # N15/S60: 1,000원 미만은 "약 …"/"…만원" 표기가 반올림하면 0이 되어
+    # 무의미하다("0만원" 은 한국어로 성립하지 않는다) - 원 단위 표기 하나만.
+    assert renderings_for(100, "KRW", -2) == ["100원"]
+    assert renderings_for(4, "KRW", -2) == ["4원"]
+    assert renderings_for(999, "KRW", -2) == ["999원"]
+
+
+def test_krw_renderings_no_zero_man_won_when_rounded_to_zero():
+    # 1,000원 이상이어도 만원 단위로 반올림하면 0이 되는 값(예: 1,400원)은
+    # "약 0원"/"0만원" 표기를 만들지 않는다.
+    out = renderings_for(1400, "KRW", -2)
+    assert not any("약" in r for r in out)
+    assert not any("0만원" in r for r in out)
+    assert "1,400원" in out
 
 
 def test_krw_renderings_negative_has_ascii_hyphen_and_shortfall_label():

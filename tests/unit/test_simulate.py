@@ -743,3 +743,409 @@ def test_b_holdout_smape_sanity_and_coverage() -> None:
     # PLAN §5.5 backtest 는 Phase 7 정식 평가의 몫이다. 여기서는 시뮬레이터가
     # 정답과 완전히 무관하지 않다는 것만 느슨하게 확인한다.
     assert coverage >= 0.4
+
+
+# ---------------------------------------------------------------------------
+# 13. B1/S45: "부족" 재정의 - 관측 가능한 결제 실패 사건
+# ---------------------------------------------------------------------------
+
+
+def test_b1_manual_case_unpaid_fixed_expense_triggers_shortfall() -> None:
+    """미납 고정비(계좌형, 잔액 부족으로 거절) 1건만으로도 `any_shortfall`
+    이 True 가 되어야 한다 - `economic < 0`(카드 float 포함) 이 아니라
+    "관측 가능한 결제 실패 사건" 정의(B1/S45)를 직접 검증한다."""
+
+    as_of = date(2026, 9, 1)
+    committed = [
+        Committed(
+            kind="RENT",
+            name="월세",
+            due=date(2026, 9, 3),
+            amount=200_000,
+            certainty=1.0,
+            account_id=10,
+            source_fixed_expense_id=1,
+        )
+    ]
+    state = _make_state(as_of=as_of, liquidity=100_000, committed=committed)
+    behavior = _make_behavior(as_of=as_of)
+
+    res = simulate(state, behavior, _EXTERNALS, horizon_days=5, n_paths=10, seed=1)
+
+    assert bool(res.any_shortfall[0]) is True
+    idx = res.dates.index(date(2026, 9, 3))
+    assert int(res.first_shortfall_idx[0]) == idx
+    # 카드 실패는 없었으므로 card_shortfall 은 별도로 False 다.
+    assert bool(res.card_shortfall[0]) is False
+
+
+def test_b1_no_shortfall_when_nothing_actually_fails() -> None:
+    """카드 출금 실패도, 미납 고정비도, 억제된 소비도 전혀 없으면(청구서
+    float 만 있어도) `any_shortfall` 은 False 여야 한다 - 이전 버전
+    (`economic < 0`)은 카드 float 만으로도 True 를 냈다(리뷰 B1)."""
+
+    as_of = date(2026, 9, 1)
+    card = CardState(
+        id=1,
+        withdrawal_weekday=5,  # 토요일 - 아직 시도되지 않는다
+        withdrawal_account_id=10,
+        card_name="테스트카드",
+        unbilled=0,
+        issued_unpaid=[IssuedBilling(billing_date=date(2026, 9, 1), amount=50_000)],
+    )
+    state = _make_state(as_of=as_of, liquidity=1_000_000, cards=[card])
+    behavior = _make_behavior(as_of=as_of)
+
+    res = simulate(state, behavior, _EXTERNALS, horizon_days=3, n_paths=10, seed=1)
+
+    # day1(economic) < 0 이 될 수 있어도(청구서 float), 그 청구서는 결국
+    # 토요일에 잔액이 충분해 정상 결제되므로 실패 사건은 전혀 없다.
+    assert bool(res.any_shortfall[0]) is False
+    assert bool(res.card_shortfall[0]) is False
+
+
+def test_b1_b_holdout_shortfall_prob_low_when_no_actual_shortfall() -> None:
+    """B 프로필 홀드아웃(as_of-30)에서 정답에 부족 사건이 0건이면
+    `shortfall_prob` 도 낮아야 한다(리뷰 B1 실측 방식 그대로 고정 - 이전
+    버전은 실제 사건 0건에 `shortfall_prob=0.528` 을 냈다)."""
+    import datetime as _dt
+
+    twin, _raw, ground_truth = generate("B_card_crunch", seed=7, months=6)
+    holdout_as_of = twin.as_of - _dt.timedelta(days=30)
+    engine = build_engine(twin, as_of=holdout_as_of)
+    holdout_end = holdout_as_of + _dt.timedelta(days=30)
+
+    gt_card_shortfalls = [
+        r
+        for r in ground_truth["card_shortfalls"]
+        if holdout_as_of.isoformat() < r["date"] <= holdout_end.isoformat()
+    ]
+    gt_declined = [
+        r
+        for r in ground_truth["declined_debits"]
+        if holdout_as_of.isoformat() < r["date"] <= holdout_end.isoformat()
+    ]
+    if gt_card_shortfalls or gt_declined:
+        pytest.skip("이 홀드아웃 창에는 정답 부족 사건이 있다 - 이 테스트는 0건 케이스 전용")
+
+    res = simulate(
+        engine.state, engine.behavior, engine.externals, horizon_days=30, n_paths=1000, seed=42
+    )
+    stats = res.stats()
+    print(f"\n[B1 holdout] shortfall_prob={stats.shortfall_prob:.4f} (gt 사건 0건)")
+    # 리뷰 실측(구 정의)은 실제 사건 0건에 shortfall_prob=0.528 을 냈다 - 새
+    # 정의는 그보다 훨씬 낮아야 한다(느슨한 회귀 방지 상한, 정확히 0을
+    # 요구하진 않는다 - 홀드아웃 마지막 며칠은 실제로 아슬아슬한 청구서가
+    # 있을 수 있다).
+    assert stats.shortfall_prob <= 0.15
+
+
+# ---------------------------------------------------------------------------
+# 14. Overrides 신규/확장 필드 (hard_caps/committed_amount_override/
+#     card_withdrawal_weekday/cancel_committed) - 죽은 필드가 없어야 한다
+# ---------------------------------------------------------------------------
+
+
+def test_hard_caps_zeroes_lambda_once_cumulative_paid_hits_cap() -> None:
+    """S55: 봉투 누적 체결분(gate_spent)이 하드 캡에 닿으면 그 달 남은 기간
+    그 봉투의 λ 가 0 이 된다 - uncapped 대비 말일 지출이 캡 근처에서
+    멈춰야 한다."""
+
+    as_of = date(2026, 9, 1)
+    state = _make_state(as_of=as_of, liquidity=5_000_000, envelope_budgets={1: 10_000_000})
+    behavior = _make_behavior(as_of=as_of, daily_rate={1: 5.0}, card_share={1: 0.0})
+
+    uncapped = simulate(
+        state, behavior, _EXTERNALS, horizon_days=25, n_paths=300, seed=3
+    )
+    uncapped_median_end = np.median(uncapped.envelope_spend[:, uncapped.envelope_ids.index(1), -1])
+
+    capped = simulate(
+        state,
+        behavior,
+        _EXTERNALS,
+        horizon_days=25,
+        n_paths=300,
+        seed=3,
+        overrides=Overrides(hard_caps={1: 50_000}),
+    )
+    ei = capped.envelope_ids.index(1)
+    capped_end = capped.envelope_spend[:, ei, -1]
+
+    assert uncapped_median_end > 50_000  # uncapped 는 확실히 캡을 넘는다
+    # 캡을 넘긴 그날의 지출까지는 넘칠 수 있지만(한 번의 초과는 허용),
+    # 그 뒤로는 더 붙지 않으므로 최종 지출이 uncapped 대비 훨씬 작다.
+    assert float(np.median(capped_end)) < float(uncapped_median_end)
+    # 대부분의 경로가 캡의 근방(다음 하루치 소비 폭 이내)에서 멈춘다.
+    assert float(np.median(capped_end)) <= 50_000 * 3
+
+
+def test_committed_amount_override_by_kind_and_source_id() -> None:
+    """B4: `committed_amount_override` 키가 `f"{kind}:{source_id}"` 형식
+    으로 RENT(source_fixed_expense_id)/LOAN(source_loan_id) 항목 금액을
+    각각 덮어쓴다."""
+
+    as_of = date(2026, 9, 1)
+    committed = [
+        Committed(
+            kind="RENT",
+            name="월세",
+            due=date(2026, 9, 3),
+            amount=200_000,
+            certainty=1.0,
+            account_id=10,
+            source_fixed_expense_id=5,
+        ),
+        Committed(
+            kind="LOAN",
+            name="대출이자",
+            due=date(2026, 9, 4),
+            amount=30_000,
+            certainty=1.0,
+            account_id=10,
+            source_loan_id=9,
+        ),
+    ]
+    state = _make_state(as_of=as_of, liquidity=10_000_000, committed=committed)
+    behavior = _make_behavior(as_of=as_of)
+
+    res = simulate(
+        state,
+        behavior,
+        _EXTERNALS,
+        horizon_days=5,
+        n_paths=1,
+        seed=1,
+        overrides=Overrides(committed_amount_override={"RENT:5": 111_000, "LOAN:9": 222_000}),
+    )
+
+    events = {(de.date, e.kind): e for de in res.event_log for e in de.events}
+    assert events[(date(2026, 9, 3), "RENT")].amount == 111_000
+    assert events[(date(2026, 9, 4), "LOAN")].amount == 222_000
+
+
+def test_card_withdrawal_weekday_override_shifts_due_date() -> None:
+    """`card_withdrawal_weekday` 오버라이드가 실제로 청구서 예정 출금일
+    계산에 반영된다(요일 자체를 바꾼 경로만 큐를 다시 확인한다)."""
+
+    as_of = date(2026, 9, 6)  # Sunday
+    card = CardState(
+        id=1,
+        withdrawal_weekday=1,  # Tuesday
+        withdrawal_account_id=10,
+        card_name="테스트카드",
+        unbilled=0,
+        issued_unpaid=[IssuedBilling(billing_date=date(2026, 9, 7), amount=10_000)],
+    )
+    state = _make_state(as_of=as_of, liquidity=1_000_000, cards=[card])
+    behavior = _make_behavior(as_of=as_of)
+
+    # 최초 `issued_unpaid` 청구서는 `pending_bill_records`(월요일 발행
+    # 경로)를 거치지 않으므로 `payment_risks()` 에는 안 잡힌다(발행 로직은
+    # `unbilled` 전용) - 대신 실제 출금 시도 이벤트(event_log, CARD_BILL)의
+    # 날짜로 예정 출금일이 실제로 옮겨갔는지 확인한다.
+    default_res = simulate(state, behavior, _EXTERNALS, horizon_days=10, n_paths=1, seed=1)
+    default_due = next(
+        de.date for de in default_res.event_log for e in de.events if e.kind == "CARD_BILL"
+    )
+    assert default_due == date(2026, 9, 8)  # 다음 화요일
+
+    overridden = simulate(
+        state,
+        behavior,
+        _EXTERNALS,
+        horizon_days=10,
+        n_paths=1,
+        seed=1,
+        overrides=Overrides(card_withdrawal_weekday={1: 3}),  # Thursday
+    )
+    overridden_due = next(
+        de.date for de in overridden.event_log for e in de.events if e.kind == "CARD_BILL"
+    )
+    assert overridden_due == date(2026, 9, 10)  # 다음 목요일
+    assert overridden_due != default_due
+
+
+def test_cancel_committed_removes_item_from_schedule() -> None:
+    """`cancel_committed` 에 담긴 `source_fixed_expense_id` 항목은 스케줄에서
+    빠지고 liquidity 도 영향받지 않는다."""
+
+    as_of = date(2026, 9, 1)
+    committed = [
+        Committed(
+            kind="SUBSCRIPTION",
+            name="구독",
+            due=date(2026, 9, 3),
+            amount=15_000,
+            certainty=1.0,
+            account_id=10,
+            source_fixed_expense_id=7,
+        )
+    ]
+    state = _make_state(as_of=as_of, liquidity=1_000_000, committed=committed)
+    behavior = _make_behavior(as_of=as_of)
+
+    res = simulate(
+        state,
+        behavior,
+        _EXTERNALS,
+        horizon_days=5,
+        n_paths=1,
+        seed=1,
+        overrides=Overrides(cancel_committed={7}),
+    )
+    idx = res.dates.index(date(2026, 9, 3))
+    assert int(res.balances[0, idx]) == 1_000_000
+    assert not any(
+        e.kind == "SUBSCRIPTION" for de in res.event_log for e in de.events
+    )
+
+
+# ---------------------------------------------------------------------------
+# 15. B4: EXTERNAL.loan_rate_delta_bp 가 LOAN(INTEREST_ONLY) 금액을 바꾼다
+# ---------------------------------------------------------------------------
+
+
+def test_loan_rate_delta_bp_repriced_for_interest_only() -> None:
+    as_of = date(2026, 9, 1)
+    committed = [
+        Committed(
+            kind="LOAN",
+            name="대출이자",
+            due=date(2026, 9, 5),
+            amount=10_000,  # rate_pct=12.0, principal=1,000,000 기준 build 값
+            certainty=1.0,
+            account_id=10,
+            source_loan_id=1,
+            rate_pct=12.0,
+            principal=1_000_000,
+            loan_repayment="INTEREST_ONLY",
+        )
+    ]
+    state = _make_state(as_of=as_of, liquidity=10_000_000, committed=committed)
+    behavior = _make_behavior(as_of=as_of)
+
+    baseline = simulate(state, behavior, _EXTERNALS, horizon_days=6, n_paths=1, seed=1)
+    base_event = next(e for de in baseline.event_log for e in de.events if e.kind == "LOAN")
+    assert base_event.amount == 10_000  # 1,000,000 * 12/100/12 = 10,000
+
+    bumped = simulate(
+        state,
+        behavior,
+        _EXTERNALS,
+        horizon_days=6,
+        n_paths=1,
+        seed=1,
+        overrides=Overrides(externals=Externals(loan_rate_delta_bp=1200)),
+    )
+    bumped_event = next(e for de in bumped.event_log for e in de.events if e.kind == "LOAN")
+    assert bumped_event.amount == 20_000  # rate 12%+12%=24% -> 1,000,000*24/100/12
+
+
+def test_loan_rate_delta_bp_no_effect_for_amortizing() -> None:
+    """원리금균등상환은 재계산 불가(문서화된 한계) - delta 를 넣어도 build
+    시점 금액이 그대로 유지된다."""
+
+    as_of = date(2026, 9, 1)
+    committed = [
+        Committed(
+            kind="LOAN",
+            name="대출이자",
+            due=date(2026, 9, 5),
+            amount=54_321,
+            certainty=1.0,
+            account_id=10,
+            source_loan_id=2,
+            rate_pct=12.0,
+            principal=1_000_000,
+            loan_repayment="AMORTIZING",
+        )
+    ]
+    state = _make_state(as_of=as_of, liquidity=10_000_000, committed=committed)
+    behavior = _make_behavior(as_of=as_of)
+
+    bumped = simulate(
+        state,
+        behavior,
+        _EXTERNALS,
+        horizon_days=6,
+        n_paths=1,
+        seed=1,
+        overrides=Overrides(externals=Externals(loan_rate_delta_bp=1200)),
+    )
+    bumped_event = next(e for de in bumped.event_log for e in de.events if e.kind == "LOAN")
+    assert bumped_event.amount == 54_321
+
+
+# ---------------------------------------------------------------------------
+# 16. N2/S47: 카드 이벤트 이름이 card_name 을 쓴다
+# ---------------------------------------------------------------------------
+
+
+def test_card_events_use_card_name() -> None:
+    as_of = date(2026, 9, 6)  # Sunday
+    card = CardState(
+        id=1,
+        withdrawal_weekday=1,
+        withdrawal_account_id=10,
+        card_name="KB체크",
+        unbilled=50_000,
+        issued_unpaid=[],
+    )
+    state = _make_state(as_of=as_of, liquidity=1_000_000, cards=[card])
+    behavior = _make_behavior(as_of=as_of)
+
+    res = simulate(state, behavior, _EXTERNALS, horizon_days=10, n_paths=1, seed=1)
+    names = {e.name for de in res.event_log for e in de.events if e.kind == "CARD_BILL"}
+    assert names == {"카드대금 KB체크"}
+
+
+# ---------------------------------------------------------------------------
+# 17. N3: 예산 0 봉투는 첫날 즉시 "소진" 되지 않는다
+# ---------------------------------------------------------------------------
+
+
+def test_zero_budget_envelope_is_not_immediately_exhausted() -> None:
+    as_of = date(2026, 9, 1)
+    state = _make_state(as_of=as_of, liquidity=1_000_000, envelope_budgets={1: 0})
+    behavior = _make_behavior(as_of=as_of, daily_rate={1: 0.0})
+
+    res = simulate(state, behavior, _EXTERNALS, horizon_days=10, n_paths=20, seed=1)
+    stats = res.stats()
+    assert stats.envelope_overrun_prob.get(1, 0.0) == 0.0
+    assert stats.envelope_exhaust_date_median.get(1) is None
+
+
+# ---------------------------------------------------------------------------
+# 18. N4: SPEND(method=CARD, card_id=...) 주입이 지정된 카드로 간다
+# ---------------------------------------------------------------------------
+
+
+def test_spend_injection_card_id_selects_the_right_card() -> None:
+    from fdt.engine.schemas.request import SpendInjection
+
+    as_of = date(2026, 9, 1)
+    cards = [
+        CardState(
+            id=1, withdrawal_weekday=1, withdrawal_account_id=10, card_name="카드1", unbilled=0
+        ),
+        CardState(
+            id=2, withdrawal_weekday=3, withdrawal_account_id=10, card_name="카드2", unbilled=0
+        ),
+    ]
+    state = _make_state(as_of=as_of, liquidity=1_000_000, cards=cards)
+    behavior = _make_behavior(as_of=as_of)
+
+    inj = SpendInjection(days_from_now=1, amount=30_000, envelope_id=1, method="CARD", card_id=2)
+    # horizon 을 다음 청구 발행(월요일 9/7)·양쪽 카드 출금 예정일(카드1
+    # 화요일 9/8, 카드2 목요일 9/10)까지 넉넉히 잡아 실제로 "카드2" 로만
+    # 청구서가 잡히는지 이벤트로 직접 확인한다.
+    res = simulate(
+        state, behavior, _EXTERNALS, horizon_days=12, n_paths=1, seed=1, injections=[inj]
+    )
+
+    # 카드2 의 청구서만 잡히고(카드1 은 전혀 건드리지 않는다), 그 청구서가
+    # 예정 출금일(목요일 9/10)에 정상 결제되며 liquidity 가 그만큼만 준다.
+    card_bill_names = {e.name for de in res.event_log for e in de.events if e.kind == "CARD_BILL"}
+    assert card_bill_names == {"카드대금 카드2"}
+    assert int(res.balances[0, -1]) == 1_000_000 - 30_000

@@ -101,6 +101,11 @@ class SpendInjection(_Base):
     amount: Amount
     envelope_id: EnvelopeId
     method: Literal["CARD", "CASH"]
+    # N4: `method=CARD` 가 항상 `state.cards[0]` 로 가던 문제(B 처럼 카드가
+    # 2장 이상이고 출금 요일이 다르면 결과가 바뀐다). 생략하면 기존처럼
+    # 첫 번째 카드(`unbilled[0]`)로 간다(하위 호환) - `simulate()` 쪽이
+    # 이 필드를 실제로 반영한다(J1 소유, simulate.py).
+    card_id: int | None = None
 
     @model_validator(mode="after")
     def _check_on(self) -> SpendInjection:

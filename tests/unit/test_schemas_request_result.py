@@ -25,6 +25,7 @@ from fdt.engine.schemas.request import (
 from fdt.engine.schemas.result import (
     AccelerationAlert,
     AppliedAction,
+    BranchSummary,
     ColumnSpec,
     ConcerningTxAlert,
     DeltaBarsData,
@@ -36,16 +37,24 @@ from fdt.engine.schemas.result import (
     EventPoint,
     EventTimelineData,
     EventTimelineViz,
+    FirstShortfallDate,
     ForecastResult,
     GaugeData,
     GaugeEncoding,
     GaugeViz,
     Health,
+    OptimizeBaseline,
+    OptimizeResult,
+    OverrideSpec,
     PaymentRisk,
+    PointStat,
     RankedAction,
     RiskResult,
     TableData,
     TableViz,
+    TrajectorySummary,
+    WhatIfDelta,
+    WhatIfResult,
 )
 from fdt.engine.taxonomy import Mode
 from fdt.tools.schema_export import export_json_schemas
@@ -225,6 +234,22 @@ def test_goal_missing_target_date_is_req_missing():
 def test_goal_envelope_adhere_forbids_targets():
     with pytest.raises(ValueError, match="E-REQ-MISSING"):
         GoalParams(goal_type="ENVELOPE_ADHERE", target_amount=1)
+
+
+def test_spend_injection_card_id_optional_defaults_none():
+    # N4: `method=CARD` 가 항상 첫 카드로 가던 문제 - `card_id` 로 특정
+    # 카드를 지정할 수 있다(생략하면 기존 동작대로 None, simulate.py 가
+    # 하위 호환으로 처리한다, J1 소유).
+    without = SpendInjection(days_from_now=1, amount=1000, envelope_id=1, method="CARD")
+    assert without.card_id is None
+
+    with_card = SpendInjection(
+        days_from_now=1, amount=1000, envelope_id=1, method="CARD", card_id=21
+    )
+    assert with_card.card_id == 21
+    dumped = with_card.model_dump(mode="json")
+    again = SpendInjection.model_validate(dumped)
+    assert again == with_card
 
 
 def test_spend_injection_both_on_and_days_from_now_fails():
@@ -410,6 +435,110 @@ def test_ranked_action_wraps_injection_with_cut_ratio():
     dumped = action.model_dump(mode="json")
     again = RankedAction.model_validate(dumped)
     assert again == action
+
+
+def test_applied_action_wraps_override_instead_of_injection():
+    # S57: `AppliedAction` 은 §8.6.1 4번째 AUTO 후보(카드 출금 요일 변경)를
+    # `injection` 대신 `override`(신규 `OverrideSpec`)로 담을 수 있다.
+    action = AppliedAction(
+        override=OverrideSpec(card_id=20, weekday=5),
+        label="카드 20 출금 요일을 토요일로 변경",
+    )
+    assert action.injection is None
+    assert isinstance(action.override, OverrideSpec)
+    assert action.override.type == "CARD_WITHDRAWAL_WEEKDAY"
+
+    dumped = action.model_dump(mode="json")
+    again = AppliedAction.model_validate(dumped)
+    assert again == action
+
+
+def test_applied_action_requires_exactly_one_of_injection_or_override():
+    with pytest.raises(ValidationError, match="정확히 하나"):
+        AppliedAction()  # 둘 다 없음
+
+    with pytest.raises(ValidationError, match="정확히 하나"):
+        AppliedAction(
+            injection={
+                "type": "BUDGET_CHANGE",
+                "envelope_id": 5,
+                "new_budget": 280000,
+            },
+            override=OverrideSpec(card_id=20, weekday=5),
+        )  # 둘 다 있음
+
+
+def test_override_spec_weekday_out_of_range_rejected():
+    with pytest.raises(ValidationError):
+        OverrideSpec(card_id=20, weekday=7)
+
+
+def _optimize_baseline() -> OptimizeBaseline:
+    return OptimizeBaseline(
+        shortfall_prob=0.31, card_shortfall_prob=0.37, end_balance_median=780000
+    )
+
+
+def test_optimize_result_notes_and_n_paths_used_roundtrip():
+    # N11: 후보 0개 -> ranked=[], notes 에 이유. N14: 실제로 시뮬을 돌린
+    # n_paths(하향값 포함)를 결과 자체에 싣는다.
+    result = OptimizeResult(
+        objective="MIN_SHORTFALL_PROB",
+        baseline=_optimize_baseline(),
+        ranked=[],
+        recommended=None,
+        evaluated=0,
+        sim_calls=1,
+        notes=["적용 가능한 후보가 없다"],
+        n_paths_used=400,
+    )
+    assert result.notes == ["적용 가능한 후보가 없다"]
+    assert result.n_paths_used == 400
+
+    dumped = result.model_dump(mode="json")
+    again = OptimizeResult.model_validate(dumped)
+    assert again == result
+
+
+def test_optimize_result_notes_defaults_empty():
+    result = OptimizeResult(
+        objective="MIN_SHORTFALL_PROB",
+        baseline=_optimize_baseline(),
+        ranked=[],
+        recommended=None,
+        evaluated=0,
+        sim_calls=1,
+        n_paths_used=1000,
+    )
+    assert result.notes == []
+
+
+def test_whatif_result_branch_level_optional_roundtrip():
+    # J2 용: RISK.health.level 과 같은 3단 등급. 옵션이라 생략하면 None.
+    summary = BranchSummary(
+        trajectory=TrajectorySummary(median=[1.0], p10=[1.0], p90=[1.0]),
+        min_point=PointStat(date=date(2026, 9, 10), median_balance=100),
+        end_point=PointStat(date=date(2026, 9, 10), median_balance=100),
+        shortfall_prob=0.1,
+        card_shortfall_prob=0.1,
+    )
+    delta = WhatIfDelta(
+        min_balance=0,
+        end_balance=0,
+        shortfall_prob=0.0,
+        card_shortfall_prob=0.0,
+        first_shortfall_date=FirstShortfallDate(),
+    )
+    without = WhatIfResult(base=summary, branch=summary, delta=delta, verdict="OK")
+    assert without.branch_level is None
+
+    with_level = WhatIfResult(
+        base=summary, branch=summary, delta=delta, verdict="CAUTION", branch_level="WARNING"
+    )
+    assert with_level.branch_level == "WARNING"
+    dumped = with_level.model_dump(mode="json")
+    again = WhatIfResult.model_validate(dumped)
+    assert again == with_level
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
-# FDT 엔진 명세 (SPEC) v0.4
+# FDT 엔진 명세 (SPEC) v0.5
 
-- 상태: v0.4 (2026-09-07, W3/W4/W5 리뷰 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
+- 상태: v0.5 (2026-09-07, W6~W10 리뷰 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
 - 범위: **엔진만**. 자연어 라우팅(에이전트), 코칭 문장 생성, 대시보드, 이체 실행은 전부 범위 밖이다.
 - 상위 문서: `../../00_특화PJT_기획/07_FINAL/01_KeyFin_기획의도.md`, `02_KeyFin_요구사항명세.md`, `FDT.md`, ERD `ERD_v1.1`(erdcloud RvbfSXjYXdjM8RdjK), 금융망 API 문서 `docs/금융_api/`.
 - 선행 구현: `../03_Finance-Digital-Twin` 의 트윈 코어 공식(설계서 §7)을 계승한다. 계승·변경 내역은 §13에 적는다.
@@ -209,14 +209,17 @@ Engine
   "liquidity": 1830000,            // PRIMARY 잔액
   "emergency_fund": 350000,        // EMERGENCY 합. 시뮬레이션이 자동 사용하지 않는다
   "cards": [{
-    "id":20, "withdrawal_weekday":1, "withdrawal_account_id":10, "unbilled":92300,   // 이번 청구 주기 누적(승인−취소)
+    "id":20, "card_name":"KB 체크", "withdrawal_weekday":1, "withdrawal_account_id":10, "unbilled":92300,   // 이번 청구 주기 누적(승인−취소)
     "issued_unpaid":[{"billing_date":"2026-09-01","amount":183500}]
+    // card_name(S47): 시뮬레이터가 약정 큐 없이 청구 이벤트를 만들 때(§7.2 3~4단계) 사람이 읽는 이름이 필요하다
   }],
   "committed": [{                  // 약정 큐, as_of+1 ~ as_of+horizon_cap(90)
     "kind":"RENT","name":"월세","due":"2026-09-25","amount":700000,"certainty":1.0,"account_id":10,"card_id":null,
-    "source_fixed_expense_id":40,"source_loan_id":null,"source_card_id":null
+    "source_fixed_expense_id":40,"source_loan_id":null,"source_card_id":null,
+    "rate_pct?":null,"principal?":null
     // kind 허용 집합: RENT | UTILITY | INSURANCE | TELECOM | SUBSCRIPTION | LOAN | CARD_BILL | SELF_TRANSFER | DETECTED_FIXED
     // DETECTED_FIXED = 원장 탐지 일반 고정비(§5.4). source_fixed_expense_id/source_loan_id/source_card_id 는 선택(?), 근거가 없으면 null
+    // rate_pct?/principal?(S64): kind==LOAN 항목에만 채운다(연이자율%, 원금). EXTERNAL.loan_rate_delta_bp 주입 시 재계산(§7.2 2단계)에 필요하다. 그 외 kind 는 null
     // 수입은 큐에 넣지 않는다(§8.2 events 로만 표현)
   }],
   "envelopes": [{
@@ -271,6 +274,10 @@ Engine
 
 `AMORTIZING` 을 실측 검증하려면 §11 프로필 중 하나(B 변형)에 `term_months` 지정 프로필을 추가해야 한다. 이는 v0.2 과제로 남긴다(SPEC 은 규칙만 정의).
 
+**S44(약정 큐의 `CARD_BILL` 이중 반영 금지).** 약정 큐의 `kind == CARD_BILL` 항목(카드대금(미청구)/(미결제) 두 행)은 `state.cards[].unbilled`/`.issued_unpaid` 와 같은 정보를 담은 as_of 스냅샷이다. `simulate`(§7.2)는 이 큐 항목을 **처리하지 않고** 카드 상태(`cards[]`)에서 청구 주기를 직접 재구성한다(이중 반영 방지). 큐의 `CARD_BILL` 은 §8.2 `events` 표시와 §8.4 확정 유출 계산에만 쓰며, §8.4 확정 유출에서는 카드 상태 기반 값과 **중복 계상하지 않도록** 이 큐 항목을 제외한다(§8.4 참조).
+
+**S64(대출이자 재계산, 한계 명시).** `EXTERNAL.loan_rate_delta_bp` 가 시뮬레이션 중 주입(§8.3 `EXTERNAL`)되면, `repayment == INTEREST_ONLY` 대출의 이자를 그 시점부터 `principal × (rate_pct + delta_bp/100) / 100 / 12` 로 재계산한다(10원 단위 반올림, `principal`/`rate_pct` 는 §5.1 `Committed` 의 LOAN 항목 필드). `repayment == AMORTIZING` 은 원리금 상환표가 고정돼 있어 금리 변경을 재계산하지 **않는다**(한계로 명시. 원리금균등 상환액의 금리 재산정은 v0.2 과제).
+
 중복 제거: 동일 (kind, name, due, amount) 는 하나. `fixed_expenses`·`loans[]`·`cards[]` 에서 이미 만든 항목과 같은 (계좌 또는 카드, 이름) 을 갖는 원장 탐지 항목(`DETECTED_FIXED`)은 만들지 않는다(대출이자·카드대금 이중 계상 방지). 단 이 키로도 (b) 의미적 중복(예: 이름이 바뀐 고정비)까지는 못 잡을 수 있다.
 
 `state.committed` 는 `as_of+1 ~ as_of+90` 구간만 담는다(§7.1 참조. `horizon_days > 90` 요청은 모드 러너가 큐를 재생성한다).
@@ -303,6 +310,8 @@ Engine
 
 각주(N13): 잔액 부족 시 거절된 체크 소비는 원장에 남지 않는다(§11). 이 때문에 잔액이 얇은 사용자일수록 `daily_rate` 는 과소, `card_share` 는 과대 추정되는 구조적 편향이 있다. 시뮬레이터가 `suppressed_demand` 를 별도로 누적할 경우, 이 편향과 `suppressed_demand` 를 함께 반영하면 억제 효과를 이중으로 세게 된다. 두 메커니즘이 같은 현상(거절)을 서로 다른 경로로 반영하고 있음을 W6/W7 이 인지해야 한다.
 
+**S49(v0.2 로 이연).** Behavior 추정 창(현행 `[as_of − 89, as_of]` 고정)을 "가용 이력 전체(상한 180일), 최소 28일" 로 완화하거나 `daily_rate`/`amount_mu` 의 표준오차를 `Behavior` 에 함께 담는 안은 v0.2 로 미룬다. 근거는 §14 R10.
+
 Behavior 는 **원장만** 읽는다. 생성기의 프로필 YAML·`ground_truth` 를 읽으면 반려(순환 검증 금지).
 
 ---
@@ -318,6 +327,13 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
 
 - `injections`: What-if 가상 이벤트 목록(§8.2 표).
 - `overrides`: 시뮬 기간 동안만 적용하는 상태 변경(예산 변경, 고정비 중단, 외부 변수 변경). 원본 `state` 는 건드리지 않는다.
+- **S65(Overrides 필드 명시).** `Overrides` 는 다음 필드만 갖는다(전부 선택):
+  - `budgets: dict[envelope_id, int]`: 봉투 예산 값 자체를 바꾼다(§8.3 `BUDGET_CHANGE` 의 소프트 경로. `behavior_follows` 에 따라 `elasticity_gate` 동반 여부가 갈린다)
+  - `hard_caps: dict[envelope_id, int]`: GOAL 하드 캡(S55). 그 달 봉투 누적이 캡에 닿으면 `λ → 0`, 필수 봉투는 하한 비율까지만 허용
+  - `cancel_committed: list[source_fixed_expense_id]`: 약정 큐에서 해당 고정비 발생원을 제거
+  - `committed_amount_override: dict["kind:source_id", int]`: 약정 큐 특정 항목의 금액을 덮어쓴다. 키는 `"{kind}:{source_fixed_expense_id|source_loan_id|source_card_id}"` 문자열
+  - `externals: Externals`: `price_index_mult`/`loan_rate_delta_bp`/`income_growth_pct` 부분 또는 전체 덮어쓰기(§8.3 `EXTERNAL`)
+  - `card_withdrawal_weekday: dict[card_id, int]`: 카드 출금 요일 임시 변경(§8.6.1 네 번째 후보, §8.6 `OverrideSpec`)
 - 결과 배열 shape `(n_paths, horizon_days+1)`. `dates[0] = as_of`(기록값은 as_of 잔액).
 - `state.committed` 는 `as_of+90` 까지만 채워져 있다(§5.4). `horizon_days > 90` 인 요청은 모드 러너가 `build_committed_queue(horizon_cap=horizon_days+7)` 로 큐를 재생성해 시뮬레이터에 넘긴다. `simulate` 자신은 큐를 다시 만들지 않는다.
 
@@ -325,7 +341,9 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
 
 ```
 1 수입      d == next_income → liquidity += expected × (1+income_growth)^(년). 불규칙이면 금액에 LogNormal(0, 0.4) 잡음, 다음일 = d + median_gap
-2 고정비    큐 due == d. 계좌형: cash ≥ amount 면 차감, 부족하면 당일 거절 → unpaid_obligation 누적(재시도 없음). 카드형: card.unbilled += amount
+2 고정비    큐 due == d, **단 kind == CARD_BILL 은 이 단계에서 처리하지 않는다**(S44. 청구·출금은 3~4단계가 `cards[]` 상태로 직접 진행한다. 큐의 CARD_BILL 은 §8.2 events 표시·§8.4 확정 유출에만 쓴다).
+            계좌형: cash ≥ amount 면 차감, 부족하면 당일 거절 → unpaid_obligation 누적(재시도 없음). 카드형(카드 결제형 고정비): card.unbilled += amount
+            kind == LOAN 이고 `EXTERNAL.loan_rate_delta_bp` 가 주입되어 있으면(§8.3) `repayment == INTEREST_ONLY` 인 항목만 `principal × (rate_pct+delta_bp/100)/100/12` 로 재계산한다(10원 단위, S64). `AMORTIZING` 은 재계산하지 않는다
             큐의 SELF_TRANSFER 는 PRIMARY 에서 차감하고 emergency_fund 에 가산한다. 부족하면 당일 건너뛴다(재시도 없음)
 3 청구 발행 d.weekday()==0 → 카드별 issued.append(unbilled); unbilled = 0
 4 카드 출금 청구서별 예정 출금일 = billing_date 이후(당일 포함) 첫 d.weekday()==withdrawal_weekday 인 날. 예정 출금일 전에는 그 청구서를 시도하지 않는다.
@@ -337,13 +355,13 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
             boost(d) = payday_boost^[수입일 ≤ d ≤ 수입일+6] × pre_payday_damp^[다음 수입일−5 ≤ d ≤ 다음 수입일−1]
             (두 창 자체가 겹칠 수 있는 날짜는 생성기가 두 계수를 곱해서 그대로 반영한다. 이것이 정본이며, §6 의 추정기 겹침 규칙과는 별개다)
             n ~ Poisson(λ); 금액 ~ LogNormal(mu, sigma) × price_index_mult, 100원 반올림
-            card_share 만큼 unbilled 로, 나머지는 cash ≥ amount 일 때 즉시 차감, 부족하면 suppressed_demand 누적
-            envelope_spend[p,e] += Σ. 달이 바뀌면 spent 리셋
-6 돌발      Bernoulli(shock_daily_prob) → LogNormal(shock_mu, shock_sigma). 봉투 기타. 카드 비율은 전체 평균
-7 주입      injections 중 on == d → 5와 같은 방식. (수입 주입은 1과 같은 방식)
+            card_share 만큼 unbilled 로, 나머지(현금분)는 그 봉투·그날 합계에 대해 **부분 체결**한다(S46): `paid = min(그 봉투·그날 현금 지출 합계, liquidity)`, `나머지 = suppressed_demand` 로 누적(개별 거래 단위 전부-또는-전무가 아니다. §7.1 벡터화 요구와 양립하고 §8.3 주입 처리와 같은 규칙이다)
+            envelope_spend[p,e] += Σ(체결된 금액만). 달이 바뀌면 spent 리셋
+6 돌발      Bernoulli(shock_daily_prob) → LogNormal(shock_mu, shock_sigma) × price_index_mult, 100원 반올림(S63). 봉투 기타. 카드 비율은 전체 평균
+7 주입      injections 중 on == d → 5와 같은 방식(부분 체결 포함). (수입 주입은 1과 같은 방식). 주입 금액은 `elasticity_gate` 가 보는 누적치에 합산하지 않는다(CRN 보존, S46)
 8 기록      balances[p,k] = liquidity
             economic[p,k] = liquidity − Σissued_unpaid − unpaid_obligation − suppressed_demand
-            liquidity < 0 → any_shortfall[p]; 처음이면 first_shortfall_idx[p]=k
+            any_shortfall[p,k] = card_shortfall[p] ∨ unpaid_obligation[p] > 0 ∨ suppressed_demand[p] > 0(S45. `economic < 0` 여부는 부족 판정에 쓰지 않고 지표로만 노출한다). 처음이면 first_shortfall_idx[p]=k
             결제 이벤트가 있던 날은 event_log[k] 에 (kind, amount, 성공 경로 비율) 기록
 ```
 
@@ -356,10 +374,12 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
 ```python
 dates: list[date]; balances, economic, envelope_spend: ndarray
 any_shortfall, card_shortfall: bool[n_paths]; first_shortfall_idx: int[n_paths]
+# any_shortfall(S45) = card_shortfall ∨ unpaid_obligation末日누적>0 ∨ suppressed_demand末日누적>0 (§7.2 8단계). economic<0 은 부족 판정에 쓰지 않는다
 event_log: list[DayEvents]
 def stats(economic=False) -> PathStats  # median/p10/p90/mean by day, min_balance, min_balance_date,
                                         # shortfall_prob, card_shortfall_prob, first_shortfall_date_median,
-                                        # end_balance_median, envelope_spend_median[e]
+                                        # end_balance_median, envelope_spend_median[e],
+                                        # expected_shortfall: any_shortfall[p]==True 인 경로의 (말일 unpaid_obligation + 말일 Σissued_unpaid + 말일 suppressed_demand) 평균(S45, §8.5 참조)
 def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name, amount, fail_prob, median_balance_before)
 ```
 
@@ -409,13 +429,15 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 
 | type | 필드 | 의미 |
 | --- | --- | --- |
-| `SPEND` | `on`(날짜 또는 `days_from_now`), `amount`, `envelope_id`, `method`(CARD/CASH) | 단건 지출 |
+| `SPEND` | `on`(날짜 또는 `days_from_now`), `amount`, `envelope_id`, `method`(CARD/CASH), `card_id?` | 단건 지출 |
 | `INCOME` | `on`, `amount` | 단건 수입 |
-| `RECURRING_SPEND` | `start`, `every_days` 또는 `day_of_month`, `amount`, `envelope_id`, `method`, `until?`(선택, 종료일) | 구독 추가 등 |
+| `RECURRING_SPEND` | `start`, `every_days` 또는 `day_of_month`, `amount`, `envelope_id`, `method`, `until?`(선택, 종료일), `card_id?` | 구독 추가 등 |
 | `FIXED_CHANGE` | `fixed_expense_id`, `new_amount` 또는 `cancel: true`, `from`(필수, 적용 시작일) | 고정비 변경·해지 |
-| `BUDGET_CHANGE` | `envelope_id`, `new_budget`, `behavior_follows`(bool, 기본 true) | 예산 변경. true 면 elasticity_gate 기준이 함께 바뀜 |
+| `BUDGET_CHANGE` | `envelope_id`, `new_budget`, `behavior_follows`(bool, 기본 true) | 예산 변경(S53). `behavior_follows=true` 면 `elasticity_gate` 기준까지 바뀐다(새 예산 대비 잔여율로 재계산). `false` 면 예산 값 자체는 바뀌어 봉투 `remaining`/`overrun_prob` 계산에 반영되지만 소비 행동(λ)은 바뀌지 않는다(기존 예산 기준 `elasticity_gate` 유지) |
 | `EXTERNAL` | `price_index_mult?`, `loan_rate_delta_bp?`, `income_growth_pct?` | 외부 변수 시나리오 |
 | `EMERGENCY_DRAW` | `on`, `amount` | 비상금 → PRIMARY 이체 |
+
+**S66(카드 지정).** `method == CARD` 인 `SPEND`/`RECURRING_SPEND` 는 `card_id?` 로 어느 카드의 `unbilled` 에 누적할지 지정한다. 생략하면 첫 관리 카드(`cards[]` 등록 순서 기준 `is_managed=true` 첫 항목)를 쓴다. 이 값은 이후 §8.2 events·§8.5 payment_risks 가 그 카드의 청구 이벤트를 구성할 때 그대로 반영된다.
 
 `result`:
 ```jsonc
@@ -425,12 +447,17 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
   "delta":  {"min_balance": -150000, "end_balance": -150000, "shortfall_prob": +0.11, "card_shortfall_prob": +0.06,
              "first_shortfall_date": {"base":null,"branch":"2026-09-24"},
              "envelopes":[{"envelope_id":5,"remaining_change":-150000,"overrun_prob_change":+0.42}]},
-  "verdict": "CAUTION",            // OK | CAUTION | DANGER  (§8.3.1)
+  "verdict": "CAUTION",            // OK | CAUTION | DANGER, 델타 기준 (§8.3.1)
+  "branch_level": "WARNING",       // SAFE | WARNING | DANGER, 분기의 절대 위험 수준 (§8.3.1, S52)
   "crn": true
 }
 ```
 
-8.3.1 판정: 분기 `card_shortfall_prob ≥ 0.5` 또는 `min_point.median_balance < 0` → DANGER. `delta.shortfall_prob ≥ 0.15` 또는 분기 최저 < 기준 최저 × 0.5 → CAUTION. 그 외 OK. 기준·분기는 같은 시드(CRN). 지출 주입 ≥ 0 이면 분기 최저 ≤ 기준 최저, 부족 확률 비감소가 **불변식**이다.
+8.3.1 판정(S52: `verdict` 는 **개입 효과(델타) 기준**으로만 낸다. 기준선이 이미 위험한 사용자에게 0원 주입도 DANGER 가 나오는 것을 막기 위함).
+
+- `verdict`: `delta.card_shortfall_prob ≥ 0.3` 또는 (기준 최저 ≥ 0 이면서 분기 최저 < 0) → DANGER. `delta.shortfall_prob ≥ 0.15` 또는 (기준 최저 > 0 이고 분기 최저 < 기준 최저 × 0.5, S51: 기준 최저가 0 이하면 이 조건은 적용하지 않는다. 부호가 뒤집히기 때문) → CAUTION. 그 외 OK.
+- `branch_level`: 분기의 **절대** 위험 수준을 별도 필드로 낸다. §8.5 RISK 의 `level` 규칙(`risk_score` 문턱 <20 SAFE, <50 WARNING, 그 외 DANGER)을 분기 `card_shortfall_prob`/`shortfall_prob` 에 그대로 적용해 계산한다.
+- 기준·분기는 같은 시드(CRN). 지출 주입 ≥ 0 이면 분기 최저 ≤ 기준 최저, 부족 확률 비감소가 **불변식**이다.
 
 ### 8.4 GOAL (목표 실현 가능성)
 
@@ -445,16 +472,26 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 ```jsonc
 {
   "feasible": true, "achieve_prob": 0.62,          // 기준 행동 그대로일 때 경로 중 목표 도달 비율
+  "achieve_prob_ci": [0.55, 0.69],                  // S54. n_paths 이항 표본오차 기반 95% CI. 표본이 얇으면 폭이 넓다
   "gap": {"median": -180000, "p10": -640000},      // 음수 = 부족
   "required": {"total_discretionary_cap": 1920000, "reduction_ratio": 0.23, "baseline_discretionary": 2490000},
   "weekly_caps": [{"week_start":"2026-09-08","days":7,"total_cap":210000,
                    "by_envelope":[{"envelope_id":1,"cap":58000}, ...]}],
-  "plan_achieve_prob": 0.88,                        // weekly_caps 를 BUDGET_CHANGE 로 주입해 재시뮬한 도달 확률
-  "notes": ["불규칙 수입은 기대치의 80%만 반영"]
+  "plan_achieve_prob": 0.88,                        // weekly_caps 를 하드 캡(Overrides.hard_caps)으로 주입해 재시뮬한 도달 확률(S55)
+  "notes": ["불규칙 수입은 기대치의 80%만 반영",
+            "baseline_discretionary 추정 표본이 얇음(window_days=84 < 120): achieve_prob 신뢰구간이 넓을 수 있음"]  // S54: window_days<120 또는 봉투 건수<30 이면 이 경고를 반드시 넣는다
 }
 ```
 
-계산: `H = target_date − as_of`(1~365). 기준 시뮬 → `achieve_prob`. 확정 유입 `I`(규칙적 수입 확정, 불규칙 ×0.8), 확정 유출 `F`(큐 + 월 반복). `available = liquidity + I − F − target`. `available < 0` → `feasible=false`, `gap` 보고. 주차 상한 = `available × days_w / H` 를 기준선 봉투 비율로 배분, 필수 봉투 하한 보장. **상한을 실제 주입해 재시뮬**한 `plan_achieve_prob` 를 함께 낸다(계획이 통계적으로도 통하는지 확인).
+계산: `H = target_date − as_of`(1~365). 기준 시뮬 → `achieve_prob`(경제 잔액이 아니라 목표 정의(§8.4 goal_type)에 따른 잔액 지표 기준). `achieve_prob_ci` 는 이항 비율의 표본오차로 계산한다(S54).
+
+`goal_type == SAVE` 의 저축 증분 지표는 **economic 기준**(카드 미결제·미납·억제 차감분을 반영한 잔액)으로 정의한다(S66). 즉 `SAVE` 의 "PRIMARY 잔액 증가분"(§8.4 params 주석, M2)은 `economic` 배열의 증가분을 말하며, 단순 `liquidity` 증가분이 아니다.
+
+확정 유입 `I`(규칙적 수입 확정, 불규칙 ×0.8), 확정 유출 `F`(큐 + 월 반복). `F` 계산에서 약정 큐의 `kind == CARD_BILL` 항목은 `cards[]` 상태(`unbilled`+`issued_unpaid`) 기반 값으로 **1회만** 계상한다(S66, S44 연계. 큐와 카드 상태를 이중으로 더하지 않는다). `available = liquidity + I − F − target`. `available < 0` → `feasible=false`, `gap` 보고.
+
+주차 상한 = `available × days_w / H` 를 기준선 봉투 비율로 배분, 필수 봉투 하한 보장. **주차 상한 합은 `min(available, baseline_discretionary, Σ현재 예산 × H/30)` 을 넘지 않는다**(S55).
+
+**상한 적용 방식(S55).** 이전 버전(`BUDGET_CHANGE` 소프트 경로)은 캡 주입이 예산을 실질적으로 인상해 `plan_achieve_prob` 이 역행하는 사례가 있었다. GOAL 은 주차 상한을 `BUDGET_CHANGE` 가 아니라 **하드 캡**(`Overrides.hard_caps: dict[envelope_id, int]`, §7.1)으로 주입해 재시뮬한다. 그 달 봉투 누적 지출이 캡에 닿으면 그 봉투의 그 달 남은 기간 `λ → 0` 으로 강제하고, 필수 봉투는 하한 비율(80%, `protect_essential`)까지만 캡을 적용한다. 재시뮬 결과가 `plan_achieve_prob` 이다(계획이 통계적으로도 통하는지 확인).
 
 ### 8.5 RISK (리스크 분석)
 
@@ -465,7 +502,7 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 {
   "risk_score": 37, "level": "WARNING",            // score = round(100 × max(card_shortfall_prob, 0.6 × shortfall_prob)), <20 SAFE, <50 WARNING
   "shortfall_prob": 0.31, "card_shortfall_prob": 0.37,
-  "worst_day": "2026-09-16", "expected_shortfall": 142000,        // 부족 경로 최저 경제 잔액 절대값 평균. 정수 원(반올림)
+  "worst_day": "2026-09-16", "expected_shortfall": 142000,        // any_shortfall 경로의 말일 (미결제+미납+억제) 합계 평균(S45, §7.3). 정수 원(반올림)
   "payment_risks": [{"due":"2026-09-09","kind":"CARD_BILL","name":"KB 체크","amount":183500,"fail_prob":0.02,"median_balance_before":1640000},   // median_balance_before 는 정수 원(반올림)
                     {"due":"2026-09-16","kind":"CARD_BILL","name":"KB 체크","amount":175000,"fail_prob":0.35,"median_balance_before":161000},
                     {"due":"2026-09-25","kind":"RENT","name":"월세","amount":700000,"fail_prob":0.30,"median_balance_before":690000}],
@@ -476,7 +513,7 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 }
 ```
 
-8.5.1 Safe-to-Spend: `days = max(1, next_income − as_of)`(없으면 30). `committed = Σ큐 amount (as_of < due < next_income)`. `raw_daily = (liquidity − committed)/days`. `factor = 1/acceleration if acceleration > 1 else 1`. `safe_today = max(0, floor((raw_daily × factor − spent_today)/100) × 100)`.
+8.5.1 Safe-to-Spend: `days = max(1, next_income − as_of)`(없으면 30). `committed = Σ큐 amount (as_of < due < next_income)`. `raw_daily = (liquidity − committed)/days`. `factor = 1/acceleration if acceleration > 1 else 1`. `safe_today = max(0, floor((min(raw_daily × factor, Σ유연 봉투 잔여 / days, spend_7d_avg × 1.5) − spent_today)/100) × 100)`(S50: 상한 3종 중 최솟값. 유연 봉투는 §8.4/§8.6.1 정의와 동일한 `{외식, 쇼핑, 취미·여가, 기타}`. 근거: 급여 며칠 전 상한 없는 계산은 남은 유동성 전액을 하루치로 몰아 비현실적인 값을 낸다).
 
 8.5.2 우려 결제: `threshold = max(0.5 × remaining_before, 3 × budget/말일, 20,000)`. `amount ≥ threshold` → WARNING, `amount ≥ remaining_before` → DANGER. 가속도: `acceleration ≥ 1.3` 이고 `spend_7d_avg ≥ 10,000` → WARNING, `≥ 1.6` DANGER.
 
@@ -500,11 +537,23 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 
 8.6.2 탐색: 단일 행동 전부 CRN 평가 → 목적함수 개선 상위 `k=6` 를 골라 2~`max_actions` 조합 그리디(한 봉투에 두 비율 동시 금지). 총 시뮬 횟수 ≤ 40 을 넘으면 후보를 잘라낸다.
 
-`ranked[].actions[]` 의 원소 타입 `AppliedAction`:
+**S56(목적값 다단 사전식 정의).** `MIN_SHORTFALL_PROB` 의 목적값은 후보를 다음 튜플의 **사전식 순서**(lexicographic, 각 항은 작을수록 좋음)로 비교한다:
+
 ```
-AppliedAction = { injection: Injection, cut_ratio?: float, label?: str }
+(max(shortfall_prob, card_shortfall_prob), 기대 부족액(expected_shortfall), −최저 경제 잔액 중앙값, −말일 잔액 중앙값)
 ```
-`injection` 은 §8.3 Injection 유니온(7종) 그대로다. `cut_ratio`/`label` 은 어떤 Injection 타입에도 없는 부가 정보이므로 `AppliedAction` 래퍼에서만 붙인다(Injection 유니온 자체는 `extra="forbid"` 를 유지한다).
+
+근거: `shortfall_prob` 이 0.0 또는 1.0 에 포화되는 프로필(예: 항상 안전하거나 항상 부족)에서 1차 항만으로는 후보가 전혀 변별되지 않아 `ranked_bars` 가 사실상 빈 차트가 된다. 2~4차 항이 동률을 깬다. `effect.delta` 는 이 튜플에서 실제로 순위를 가른 차원의 값을 담는다(1차 항이 동률이면 2차 항의 델타, 등).
+
+`ranked[].actions[]` 의 원소 타입 `AppliedAction`(S57):
+```
+AppliedAction = { injection?: Injection, override?: OverrideSpec, cut_ratio?: float, label?: str }
+```
+`injection` 과 `override` 중 **정확히 하나만** 있어야 한다. `injection` 은 §8.3 Injection 유니온(7종) 그대로다. `override` 는 `OverrideSpec` 유니온으로, §8.6.1 네 번째 후보(카드 출금 요일 변경)처럼 Injection 으로 표현되지 않는 상태 변경을 담는다:
+```
+OverrideSpec = CARD_WITHDRAWAL_WEEKDAY { card_id: int, new_weekday: int }   // 0=월 … 6=일
+```
+`cut_ratio`/`label` 은 어떤 `Injection`/`OverrideSpec` 타입에도 없는 부가 정보이므로 `AppliedAction` 래퍼에서만 붙인다(Injection·OverrideSpec 유니온 자체는 `extra="forbid"` 를 유지한다).
 
 `result`:
 ```jsonc
@@ -516,9 +565,16 @@ AppliedAction = { injection: Injection, cut_ratio?: float, label?: str }
                           "cut_ratio":0.3,"label":"쇼핑 예산 30% 축소"}],
               "effect":{"shortfall_prob":0.12,"delta":-0.19,"end_balance_median":1010000,"cost_of_action":"쇼핑 월 12만원 감소"},
               "feasibility_note":"이번 달 이미 사용 21만원, 남은 한도 7만원"},
+             {"rank":2,
+              "actions":[{"override":{"type":"CARD_WITHDRAWAL_WEEKDAY","card_id":20,"new_weekday":2},
+                          "label":"카드 출금 요일을 수요일로 변경"}],
+              "effect":{"shortfall_prob":0.31,"delta":0.0,"end_balance_median":780000,"cost_of_action":"카드 출금일 이동"},
+              "feasibility_note":"1차 항 동률, 기대 부족액 감소로 순위 결정(S56)"},
              ...],
   "recommended": {"rank":1, "combined_effect":{...}},
-  "evaluated": 23, "sim_calls": 24
+  "evaluated": 23, "sim_calls": 24,
+  "n_paths_used": 400,                              // S66. §12 근거로 자동 하향된 n_paths 실측값
+  "notes": ["1차 목적항(shortfall_prob)이 다수 후보에서 포화되어 2~4차 항으로 순위를 결정함(S56)"]  // S66. OptimizeResult 에 notes[] 추가
 }
 ```
 
@@ -560,6 +616,8 @@ AppliedAction = { injection: Injection, cut_ratio?: float, label?: str }
 
 규칙: 금액은 원 단위 정수, `precision=-2` 는 100원, `-4` 는 만원 반올림 표기 허용. 확률은 `unit:"%"` 정수 또는 `unit:"prob"` 소수 둘 중 하나로 통일(모드 내 일관). 날짜는 `unit:"date"` 이고 `allowed_renderings` 에 절대 날짜와 상대 표현("17일 뒤") 둘 다 넣는다. 모드별 필수 fact 목록은 §9.4.
 
+**S60(KRW 반올림 표기 규칙).** `value < 1,000` 원이면 `allowed_renderings` 는 **원 단위 표기 하나만** 낸다(예: `["100원"]`). `약 …`/`…만원` 등 반올림 표기는 그 반올림 결과가 0 이 되면 생성하지 않는다(예: 100원은 `"0원"`/`"0만원"`/`"약 0원"` 을 내지 않는다).
+
 ### 9.3 viz (시각화 명세 어휘 8종)
 
 렌더러 독립 명세. 각 항목은 `{"kind","id","title","priority","data","encoding","annotations","caption"}`. `priority` 1은 답변에 반드시 포함, 2는 상세 보기, 3은 선택.
@@ -578,6 +636,13 @@ AppliedAction = { injection: Injection, cut_ratio?: float, label?: str }
 annotations: `[{"type":"point|vline|hline|range","x?":date,"y?":number,"label":"최저점 11.8만원"}]`. 수치 라벨은 반드시 `facts` 에 있는 값만 쓴다(테스트로 검사).
 
 `caption` 은 한 문장 한국어 요약. 숫자는 facts 표기만 사용.
+
+**S58(제목의 요청 파라미터 값).** `title`/`caption` 에 `horizon_days` 처럼 요청 파라미터에서 온 값을 넣으려면 빌더(`build_viz`)가 그 값을 인자로 받아야 한다. 예: FORECAST/RISK 제목은 고정 문자열 `"30일 결제 부족 위험"` 이 아니라 `"{horizon_days}일 결제 부족 위험"` 로 짓는다(요청의 실제 `horizon_days` 를 채운다). 숫자를 뺄 수 있으면 빼도 된다.
+
+**S59(수치 라벨 검사 범위·방법).**
+1. "수치 라벨" 은 `annotations[].label`, `caption`, `title`, `data.*.{label,name,detail}` **전부**를 포함한다(어느 한 곳도 예외가 아니다).
+2. 검사 방법: 그 문자열을 토큰화한 것을 facts `allowed_renderings` 를 토큰화한 **집합**과 **정확히 일치**시켜 검사한다(부분 문자열 포함 매칭은 허용하지 않는다. `fdt validate` R7 이 이 방식으로 구현돼야 한다).
+3. 예외: 순위·개수 같은 서수·계수 표현(정규식 `\d+(위|개|건|번째)`, 예: "1위", "3개", "2건", "5번째")은 이 검사에서 제외한다(facts 에 없어도 된다). 그 외 수치는 전부 검사 대상이다.
 
 ### 9.4 모드별 필수 facts · viz
 
@@ -620,9 +685,11 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | A_steady | 고정 급여 25일 315만, 체크카드 위주, 탄력도 0.75, 월 30만 비상금 적립 | 지출/수입 75~85% | .05 | FORECAST 기준선, RISK 가 조용히 SAFE |
 | B_card_crunch | 급여 25일 287만, 카드 2장(화·토 출금) 90%, 월세 70만·대출 1,200만 6.8% | 지출/수입 88~96%, card_shortfalls 3~8건 | .10 | RISK, WHATIF(카드 청구 큐 전이) |
 | C_impulsive | 프리랜서 불규칙 입금 월 2~4회, 주말 배수 2.4, 탄력도 1.4, 돌발 잦음 | - | .18 | FORECAST 밴드 폭, OPTIMIZE |
-| D_goal_saver | 급여 10일 260만, 구독 5개, 예산 확정 상태, 12월 말까지 as_of 잔액 대비 200만원 추가 저축(goal_type SAVE) 이 현 소비 유지 시 아슬아슬하게 미달 | 월 잉여 40~48만, as_of 잔액 250~350만 | .08 | GOAL, OPTIMIZE(구독 해지 후보) |
+| D_goal_saver | 급여 10일 260만, 구독 5개, 예산 확정 상태, 12월 말까지 as_of 잔액 대비 200만원 추가 저축(goal_type SAVE) 이 현 소비 유지 시 아슬아슬하게 미달 | (S61) **6개월 생성 기준**: 완결 월 잉여 평균 45~52만, 월별 σ ≤ 9만, as_of 잔액 250~350만 | .08 | GOAL, OPTIMIZE(구독 해지 후보) |
 
-생성 규칙은 §7.2 하루 처리 순서와 **동일**해야 한다(생성기가 시뮬레이터의 정답 분포). 생성기가 엔진에 숨기는 변수: payday_boost, elasticity, 돌발 분포, 취소 확률, 더치페이, 잔액 부족 시 체크 거절(원장 미기록). 생성기는 `confirm_status` 의 `PENDING` 을 소비(SPEND) 거래에만 부여한다. 수입·고정비·카드대금·자기이체는 `CONFIRMED` 다. `ground_truth.json`: `daily_balance`, `card_shortfalls[]`, `declined_debits[]`(원소에 `kind`: FIXED | LOAN | SPEND 포함), `shocks[]`, `envelope_true_spend`, `income_events[]`, `hidden_params`, `unpaid_obligation`(일별 누적), `suppressed_demand`(일별 누적). **엔진 코드는 ground_truth 를 읽지 않는다.**
+(S61) D 프로필의 "as_of 잔액 250~350만" 목표는 `months=6` 생성에서만 성립한다(`months=3` 은 115~183만). 목표를 5 시드 실측 분산에 맞춰 재조정했다(이전 "월 잉여 40~48만"은 5시드×4완결월=20관측치 범위 101,500~702,000원, σ≈160,000 과 맞지 않았다). 재조정된 목표는 생성기 파라미터 튜닝(v0.2, W1 담당)이 완료된 뒤 실측으로 재검증한다.
+
+생성 규칙은 §7.2 하루 처리 순서와 **동일**해야 한다(생성기가 시뮬레이터의 정답 분포). (S62) §7.2 2단계와 동일하게, **비상금 자기이체는 PRIMARY 잔액이 부족하면 당일 건너뛴다(재시도 없음)**. 이는 생성기·시뮬레이터 공통 규칙이며, 현재 생성기가 이를 어기고 있어 v0.2 에서 바로잡는다. 생성기가 엔진에 숨기는 변수: payday_boost, elasticity, 돌발 분포, 취소 확률, 더치페이, 잔액 부족 시 체크 거절(원장 미기록). 생성기는 `confirm_status` 의 `PENDING` 을 소비(SPEND) 거래에만 부여한다. 수입·고정비·카드대금·자기이체는 `CONFIRMED` 다. `ground_truth.json`: `daily_balance`, `card_shortfalls[]`, `declined_debits[]`(원소에 `kind`: FIXED | LOAN | SPEND 포함), `shocks[]`, `envelope_true_spend`, `income_events[]`, `hidden_params`, `unpaid_obligation`(일별 누적), `suppressed_demand`(일별 누적). **엔진 코드는 ground_truth 를 읽지 않는다.**
 
 시드 교란: `fdt gen --profile B --seed 1..20` 으로 캘리브레이션 표본 확보.
 
@@ -642,6 +709,8 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | P10~P90 커버리지 | 0.6 ~ 0.95 (C 는 0.5~0.95) |
 | 리스크 캘리브레이션 (23 사용자 × 7일 간격 as_of) | ECE ≤ 0.15, Brier < 기준율 Brier |
 | 단조성 | 지출 주입 증가 → 부족 확률 비감소, 최저 잔액 비증가 (전 프로필·as_of 표본) |
+
+**백테스트 예비 측정(2026-09-07, 5 시드, `docs/reviews/20260907_W6_W10.md`).** sMAPE A .018, B .094(기준 .25 이내 통과), **C .559(기준 .40 초과, 4/5 시드 초과, FAIL)**, D .022. 성능 12 항목은 전부 기준의 1/30 이하. C 실패 원인은 §7.2 5단계 현금 억제를 전부-또는-전무 판정으로 뒀던 것과 불규칙 수입 간격을 결정론으로 둔 것 두 가지로 특정했다(S46 이 전자를, S48 이연이 후자를 다룬다). **C 프로필 기준 재검토 메모(v0.2):** S46 반영 후 재측정해 sMAPE .40 기준을 다시 통과하는지 확인하고, 통과하지 못하면 C 의 기준치 자체(현재 .40)를 재조정할지 결정한다.
 
 ---
 
@@ -669,13 +738,14 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | R2 | 카드 할부 API 부재(요구사항 미결 #6) | `loans[AMORTIZING]` 으로 재현. 할부 개념은 엔진에 두지 않음 |
 | R3 | 봉투 주기가 달력 월인데 급여일이 다름 | v0.1 달력 월 고정. `cycle_anchor: PAYDAY` 옵션은 v0.2 |
 | R4 | OPTIMIZE 후보 폭발 | 시뮬 ≤ 40회, n_paths 자동 하향, 결과에 `evaluated/sim_calls` 명시 |
-| R5 | 불규칙 수입 예측 오차 | 기준 완화(C). v0.2 에 수입 간격 분포 샘플링 |
+| R5 | 불규칙 수입 예측 오차 | 기준 완화(C). v0.2 에 수입 간격 분포 샘플링(S48 이연). 정량 근거: C 프로필 커버리지가 5 시드 중 4회 0.6 이하로 나온다(원인은 §7.2 1단계 간격 잡음을 결정론(`median_gap` 고정)으로 둔 것이며, 생성기와 같은 잡음 `d + max(3, round(median_gap + N(0, 0.3·median_gap)))` 을 v0.2 에서 시뮬레이터에도 반영한다) |
 | R6 | `is_variable` 고정비 금액 추정 실패 | 원장 중앙값 없으면 0 + 경고. facts 에 `unknown_variable_fixed` 노출 |
 | R7 | facts 와 viz 라벨 불일치 | `fdt validate` 가 annotations·caption 의 숫자를 facts 집합과 대조 |
 | R8 | 생성기·시뮬레이터 규칙 발산 | §7.2 를 정본으로 삼는다. 두 코드가 공유 상수 모듈을 쓰게 하고, §15.A 표를 두 코드 공통 테스트로 고정한다 |
 | R9 | C 프로필처럼 수입 간격이 짧은 사용자는 `payday_boost`/`pre_payday_damp` 신뢰구간이 넓다 | §6 겹침 규칙(수입 간격 < 12일 또는 불규칙 → `pre_payday_damp=1.0` 고정, `payday_boost` 는 급여 전 창 제외)으로 완화. 근본 해결은 v0.2 표본 확대·구간 추정 |
+| R10 | Behavior 추정 표본 오차(90일 창)가 A·D 커버리지 이탈과 D GOAL `achieve_prob` 분산의 직접 원인 | S49 이연. 정량 근거: 90일 창에서 봉투별 건수 추정이 시드에 따라 ±26% 흩어져 30일 누적 소비가 0.74~1.10배로 갈리고, 이것이 A·D 커버리지 이탈과 D GOAL `achieve_prob` 0.006~0.983 분산의 직접 원인이다. v0.2 에 추정 창 확대(가용 이력 전체, 상한 180일) 또는 표준오차 노출 |
 | M1 | 확률 표기를 % 정수로 할지 소수로 할지 | 모드 내 통일만 강제. 에이전트 팀과 합의 후 고정 |
-| M2 | GOAL `SAVE` 타입의 "저축" 정의(비상금 이체 포함 여부) | v0.1: PRIMARY 잔액 증가분으로 정의 |
+| M2 | GOAL `SAVE` 타입의 "저축" 정의(비상금 이체 포함 여부) | v0.1: PRIMARY 잔액 증가분(economic 기준, S66)으로 정의 |
 
 ---
 
@@ -703,7 +773,7 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 ### C. RISK 결과 viz 예 (축약)
 
 ```jsonc
-[{"kind":"gauge","id":"risk","title":"30일 결제 부족 위험","priority":1,
+[{"kind":"gauge","id":"risk","title":"{horizon_days}일 결제 부족 위험","priority":1,
   "data":{"value":37,"min":0,"max":100,"thresholds":[20,50],"level":"WARNING"},"encoding":{"unit":"점"},
   "caption":"위험 점수 37점, 주의 단계."},
  {"kind":"table","id":"payments","title":"결제일별 부족 확률","priority":1,
@@ -781,3 +851,32 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | 추가1 | §9.1 `meta.warnings` 를 `ResultWarning{code, message, details}` 배열로 명시(자유 dict 지양) |
 | 추가2 | §6 각주(N13)로 거절된 체크 소비(원장 미기록)로 인한 잔액 얇은 사용자의 `daily_rate` 과소·`card_share` 과대 편향과, 시뮬레이터 `suppressed_demand` 와의 이중 계산 위험을 명시 |
 | 추가3 | §4.1 `Engine.save/load` 표기를 `fdt/tools/engine_io.save_engine`/`load_engine` 로 정정하고 `Engine.to_dict`/`from_dict` 를 명시. `EngineBuildMeta`(엔진 내부)와 `EngineMeta`(§9.1 출력) 를 구분하는 한 줄 추가 |
+
+`docs/reviews/20260907_W6_W10.md` W6~W10 리뷰의 "SPEC 수정 제안" 반영 내역 (v0.4 → v0.5).
+
+| # | 요약 |
+| --- | --- |
+| S44 | §5.4/§7.2 2단계에 "약정 큐의 `kind == CARD_BILL` 항목은 as_of 스냅샷이며 `state.cards[].unbilled`/`.issued_unpaid` 와 같은 정보다. `simulate` 는 이 항목을 처리하지 않고 카드 상태에서 청구 주기를 직접 재구성한다(이중 반영 방지). 큐의 `CARD_BILL` 은 §8.2 events 표시와 §8.4 확정 유출 계산에만 쓰며, 후자에서는 카드 상태 기반 값과 중복 계상하지 않도록 제외한다" 명시 |
+| S45 | §7.2 8단계/§8.2/§8.5 "부족"(`any_shortfall`)의 정의를 `card_shortfall ∨ unpaid_obligation > 0 ∨ suppressed_demand > 0` 로 변경. `economic` 잔액은 지표로 계속 노출하되 부족 판정에 쓰지 않는다. `expected_shortfall` 을 "그 사건이 발생한 경로의 말일 미결제+미납+억제 합계 평균" 으로 재정의(§7.3, §8.5) |
+| S46 | §7.2 5단계/§8.3 현금 소비 억제를 "그 봉투·그날 현금 지출 합계에 대한 부분 체결(`paid = min(합계, liquidity)`, 나머지는 `suppressed_demand`)" 로 명문화. 주입은 `elasticity_gate` 가 보는 누적치에 합산하지 않는다(CRN 보존)를 §7.2 7단계에 명시 |
+| S47 | §5.1 `CardState` 에 `card_name` 필드 추가(시뮬레이터가 큐 없이 청구 이벤트를 만들 때 사람이 읽는 이름이 필요) |
+| S48 | v0.2 로 이연. §14 R5 에 "C 프로필 커버리지 5시드 중 4회 0.6 이하" 정량 근거 기록. 불규칙 수입 간격 잡음(생성기와 동일 공식)을 시뮬레이터에도 반영하는 안 |
+| S49 | v0.2 로 이연. §14 R10 신설: "추정 표본 오차 ±26%" 근거(90일 창에서 봉투별 건수 추정이 시드에 따라 ±26% 흩어져 30일 누적 소비가 0.74~1.10배로 갈리고, A·D 커버리지 이탈과 D GOAL achieve_prob 분산의 직접 원인) |
+| S50 | §8.5.1 `safe_to_spend_today` 상한을 `min(raw_daily × factor, Σ유연 봉투 잔여/days, spend_7d_avg × 1.5)` 로 추가. 근거: 급여 3일 전 D 프로필에서 884,300원/일이 나온다 |
+| S51 | §8.3.1 CAUTION 판정의 "분기 최저 < 기준 최저 × 0.5" 에 "기준 최저 > 0 일 때만 적용" 가드 추가(기준 최저가 음수면 부호가 뒤집힘) |
+| S52 | §8.3.1 DANGER/CAUTION 판정을 델타 기준으로만 내도록 재정의(`delta.shortfall_prob ≥ 0.15` 등)하고, 분기의 절대 위험은 `branch_level` 필드(§8.5 RISK level 규칙)로 분리 |
+| S53 | §8.3 표 `BUDGET_CHANGE` 설명을 "`behavior_follows=true` 면 `elasticity_gate` 기준까지 바뀐다. `false` 면 예산 값은 바뀌어 봉투 `remaining`/`overrun_prob` 계산에 반영되지만 소비 행동(λ)은 바뀌지 않는다" 로 명확화 |
+| S54 | §8.4 `GoalResult` 에 `achieve_prob_ci` 추가. `baseline_discretionary` 추정 표본이 얇으면(`window_days < 120` 또는 봉투 건수 < 30) `notes` 에 경고를 넣도록 명시 |
+| S55 | §8.4/§7.1 GOAL 의 "상한을 실제 주입해 재시뮬" 을 `BUDGET_CHANGE` 가 아니라 하드 캡(`Overrides.hard_caps: dict[envelope_id, int]`, 캡에 닿으면 λ→0, 필수 봉투는 하한 비율까지)으로 규정. "주차 상한 합 ≤ min(available, baseline_discretionary, Σ현 예산 × H/30)" 명시 |
+| S56 | §8.6 `MIN_SHORTFALL_PROB` 의 목적값을 다단 사전식 `(max(shortfall_prob, card_shortfall_prob), 기대 부족액, −최저 경제 잔액 중앙값, −말일 잔액 중앙값)` 으로 정의. `effect.delta` 는 실제로 순위를 가른 차원의 값을 담는다 |
+| S57 | §8.6 `AppliedAction` 을 `{ injection?: Injection, override?: OverrideSpec, cut_ratio?: float, label?: str }` 로 확장하고 `OverrideSpec = CARD_WITHDRAWAL_WEEKDAY { card_id, new_weekday }` 신설(§8.6.1 네 번째 후보 표현). `injection`/`override` 중 정확히 하나 |
+| S58 | §9.3/§15.C viz `title`/`caption` 에 `horizon_days` 같은 요청 파라미터 값을 넣으려면 빌더가 그 값을 받아야 함을 명시하고, §15.C 예시 제목을 `"{horizon_days}일 결제 부족 위험"` 으로 수정 |
+| S59 | §9.3/§14 R7 ①수치 라벨 범위를 `annotations[].label`·`caption`·`title`·`data.*.{label,name,detail}` 전부로 명시 ②검사 방법을 "facts `allowed_renderings` 를 토큰화한 집합과 정확 일치" 로 규정 ③서수·계수(`\d+(위|개|건|번째)`) 는 이 검사에서 예외 |
+| S60 | §9.2 KRW `allowed_renderings` 규칙에 "1,000원 미만이면 원 단위 표기 하나만 낸다. 반올림 결과가 0 이면 `약 …`/`…만원` 표기를 생성하지 않는다" 추가 |
+| S61 | §11 D 프로필 목표를 "6개월 생성 기준 완결 월 잉여 평균 45~52만, 월별 σ ≤ 9만, as_of 잔액 250~350만" 으로 재조정(5시드 실측 분산 근거) |
+| S62 | §11 생성기 규칙에 "비상금 자기이체는 PRIMARY 잔액이 부족하면 당일 건너뛴다(재시도 없음)" 를 §7.2 2단계와 동일하게 다시 못 박음(현 생성기가 이를 어김) |
+| S63 | §7.2 6단계 돌발 금액에도 `price_index_mult` 적용(100원 반올림) |
+| S64 | §5.1 `Committed` 에 `rate_pct?`/`principal?`(LOAN) 추가. §5.4/§7.2 2단계에 "`EXTERNAL.loan_rate_delta_bp` 주입 시 `INTEREST_ONLY` 대출이자를 `principal×(rate+delta)/1200` 으로 재계산(10원 단위), `AMORTIZING` 은 재계산하지 않는다(한계 명시)" 추가 |
+| S65 | §7.1 `Overrides` 필드 목록 명시: `budgets`, `hard_caps`, `cancel_committed(source_fixed_expense_id)`, `committed_amount_override(키 "kind:source_id")`, `externals`, `card_withdrawal_weekday` |
+| S66 | §8.2/§8.3/§8.5 `SpendInjection.card_id?` 로 카드 지정(없으면 첫 관리 카드). §8.4 GOAL SAVE 지표를 economic 기준(카드 미결제 차감)으로 명시하고 확정 유출에서 큐 CARD_BILL 은 카드 상태 기반 값으로 1회만 계상(S44 연계). §8.6 `OptimizeResult` 에 `notes[]`, `n_paths_used` 추가 |
+| 추가1 | §12 성능·품질 표에 "백테스트 예비 측정(2026-09-07, 5 시드)" 결과 요약(A .018, B .094, C .559 FAIL, D .022)과 C 프로필 기준 재검토 메모(v0.2) 추가 |
