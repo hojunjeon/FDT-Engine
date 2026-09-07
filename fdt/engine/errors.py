@@ -17,7 +17,12 @@ class FdtError(Exception):
     MESSAGES 의 기본 한국어 메시지를 쓴다.
     """
 
-    def __init__(self, code: str, message: str | None = None, details: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
         self.code = code
         self.details = details or {}
         self.message = message or MESSAGES.get(code, code)

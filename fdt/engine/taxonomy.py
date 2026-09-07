@@ -7,7 +7,7 @@ SPEC.md 1장(범위), 2장(용어), 3.2(스키마), 5.2(흐름 판정), 7.2(하�
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 # ---------------------------------------------------------------------------
 # 7대 소비 봉투 (SPEC 2장 "봉투", 요구사항명세 봉투/세분류 표)
@@ -88,7 +88,7 @@ def envelope_of(subcategory_id: int | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-class Flow(str, Enum):
+class Flow(StrEnum):
     """거래 성격 (SPEC 2장 "흐름")."""
 
     INCOME = "INCOME"
@@ -99,7 +99,7 @@ class Flow(str, Enum):
     SPEND = "SPEND"
 
 
-class FixedExpenseType(str, Enum):
+class FixedExpenseType(StrEnum):
     """고정비 유형 (SPEC 3.2 fixed_expenses.expense_type)."""
 
     RENT = "RENT"
@@ -111,7 +111,7 @@ class FixedExpenseType(str, Enum):
     TELECOM = "TELECOM"
 
 
-class TxType(str, Enum):
+class TxType(StrEnum):
     """거래 유형 (SPEC 3.2 transactions.tx_type)."""
 
     CARD = "CARD"
@@ -120,7 +120,7 @@ class TxType(str, Enum):
     TRANSFER = "TRANSFER"
 
 
-class ExcludeTag(str, Enum):
+class ExcludeTag(StrEnum):
     """봉투 차감 제외 태그 (SPEC 3.2, 5.2)."""
 
     NONE = "NONE"
@@ -130,7 +130,7 @@ class ExcludeTag(str, Enum):
     CARRYOVER = "CARRYOVER"
 
 
-class ConfirmStatus(str, Enum):
+class ConfirmStatus(StrEnum):
     """거래 확정 상태 (SPEC 3.2 transactions.confirm_status)."""
 
     AUTO = "AUTO"
@@ -138,28 +138,28 @@ class ConfirmStatus(str, Enum):
     CONFIRMED = "CONFIRMED"
 
 
-class TxStatus(str, Enum):
+class TxStatus(StrEnum):
     """거래 상태 (SPEC 3.2 transactions.status)."""
 
     NORMAL = "NORMAL"
     CANCELED = "CANCELED"
 
 
-class CardKind(str, Enum):
+class CardKind(StrEnum):
     """카드 종류 (SPEC 3.2 cards.kind)."""
 
     CREDIT = "CREDIT"
     DEBIT = "DEBIT"
 
 
-class RepaymentType(str, Enum):
+class RepaymentType(StrEnum):
     """대출 상환 방식 (SPEC 3.2 loans.repayment)."""
 
     INTEREST_ONLY = "INTEREST_ONLY"
     AMORTIZING = "AMORTIZING"
 
 
-class Mode(str, Enum):
+class Mode(StrEnum):
     """엔진 실행 모드 5종 (SPEC 8장)."""
 
     FORECAST = "FORECAST"
