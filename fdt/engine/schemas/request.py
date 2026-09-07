@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NoReturn
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
@@ -32,7 +32,7 @@ class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _fail(code: str, message: str) -> None:
+def _fail(code: str, message: str) -> NoReturn:
     raise ValueError(f"{code}: {message}")
 
 
@@ -335,7 +335,8 @@ class ModeRequest(_Base):
             return data
 
         mode_raw = data.get("mode")
-        _require(mode_raw is not None, E_REQ_MISSING, "mode 가 필요하다")
+        if mode_raw is None:
+            _fail(E_REQ_MISSING, "mode 가 필요하다")
         try:
             mode = Mode(mode_raw)
         except ValueError:
