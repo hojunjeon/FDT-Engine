@@ -1,6 +1,6 @@
-# FDT 엔진 명세 (SPEC) v0.7
+# FDT 엔진 명세 (SPEC) v0.8
 
-- 상태: v0.7 (2026-09-07, S49 앞당김 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
+- 상태: v0.8 (2026-09-07, S49 L1 결정·QA-101/102/108/08/09 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
 - 범위: **엔진만**. 자연어 라우팅(에이전트), 코칭 문장 생성, 대시보드, 이체 실행은 전부 범위 밖이다.
 - 상위 문서: `../../00_특화PJT_기획/07_FINAL/01_KeyFin_기획의도.md`, `02_KeyFin_요구사항명세.md`, `FDT.md`, ERD `ERD_v1.1`(erdcloud RvbfSXjYXdjM8RdjK), 금융망 API 문서 `docs/금융_api/`.
 - 선행 구현: `../03_Finance-Digital-Twin` 의 트윈 코어 공식(설계서 §7)을 계승한다. 계승·변경 내역은 §13에 적는다.
@@ -310,7 +310,7 @@ Engine
 
 각주(N13): 잔액 부족 시 거절된 체크 소비는 원장에 남지 않는다(§11). 이 때문에 잔액이 얇은 사용자일수록 `daily_rate` 는 과소, `card_share` 는 과대 추정되는 구조적 편향이 있다. 시뮬레이터가 `suppressed_demand` 를 별도로 누적할 경우, 이 편향과 `suppressed_demand` 를 함께 반영하면 억제 효과를 이중으로 세게 된다. 두 메커니즘이 같은 현상(거절)을 서로 다른 경로로 반영하고 있음을 W6/W7 이 인지해야 한다.
 
-**S49(적용, v0.7).** Behavior 추정 창을 고정 90일에서 "가용 이력 전체, 상한 180일, 하한 28일(부족하면 있는 만큼)" 로 완화했다. `daily_rate`/`amount_mu` 의 표준오차를 `Behavior` 에 함께 담아 축소 추정(shrinkage, α=14)을 적용하는 안은 이번 판에는 포함하지 않는다. L1 이 이를 추가 채택할 수 있으며, 그 결정은 L1 보고 후 다음 판에 반영한다. 근거는 §14 R10.
+**S49(적용, v0.8).** Behavior 추정 창을 고정 90일에서 "가용 이력 전체, 상한 180일, 하한 28일(부족하면 있는 만큼)" 로 완화했다(창 180일 채택). `daily_rate` 축소 추정(shrinkage, α=14)은 L1 이 측정 후 기각했다 - D seed1 커버리지가 0.233→0.067 로 악화하고 B 는 5/5 통과에서 4/5 로 퇴행했다(근거 `docs/EVAL_REPORT.md` 변경 이력). 잔여 커버리지 이탈(A/D)은 파라미터 자체의 표본 오차를 경로에 반영하는 부트스트랩이 필요하며 v0.2 로 이월한다. 근거는 §14 R10.
 
 Behavior 는 **원장만** 읽는다. 생성기의 프로필 YAML·`ground_truth` 를 읽으면 반려(순환 검증 금지).
 
@@ -425,6 +425,8 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 }
 ```
 
+**`events[]` 집계 규칙(QA-108).** `events` 는 약정 큐(committed queue)·수입 일정을 그대로 나열하지 않고 다음과 같이 집계한다: 불규칙 수입은 회차별 중앙값 예상일 1건만 낸다(매일 나열하지 않는다). 카드대금은 카드·청구서별 예정 출금일 1건만 낸다(`fail_prob` 은 그 예정일 당일 실패 경로 비율이다. §7.2 4단계의 재시도로 발생하는 이후 날짜의 재시도 성공 건은 나열하지 않는다).
+
 ### 8.3 WHATIF (분기 생성)
 
 `params.injections[]` (1개 이상):
@@ -451,7 +453,9 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
              "envelopes":[{"envelope_id":5,"remaining_change":-150000,"overrun_prob_change":+0.42}]},
   "verdict": "CAUTION",            // OK | CAUTION | DANGER, 델타 기준 (§8.3.1)
   "branch_level": "WARNING",       // SAFE | WARNING | DANGER, 분기의 절대 위험 수준 (§8.3.1, S52)
-  "crn": true
+  "crn": true,
+  "branch_events": [{"date":"2026-09-10","kind":"SPEND","name":"주입: 쇼핑","amount":150000,"fail_prob":0.0}],   // QA-08/09. §8.2 events 규칙과 같은 방식으로 집계한 분기 전용 이벤트(주입으로 생기거나 없어진 이벤트). FIXED_CHANGE cancel 로 사라진 이벤트는 base 에는 있고 branch_events 에는 없는 방식으로 확인한다
+  "envelope_spend_median": {"base":[{"envelope_id":1,"spend_median":212400}], "branch":[{"envelope_id":1,"spend_median":233640}]}   // QA-09. 봉투별 지출 중앙값을 base/branch 양쪽에 노출(EXTERNAL.price_index_mult 등 봉투별 델타를 직접 검증할 수 있게 한다)
 }
 ```
 
@@ -553,7 +557,7 @@ AppliedAction = { injection?: Injection, override?: OverrideSpec, cut_ratio?: fl
 ```
 `injection` 과 `override` 중 **정확히 하나만** 있어야 한다. `injection` 은 §8.3 Injection 유니온(7종) 그대로다. `override` 는 `OverrideSpec` 유니온으로, §8.6.1 네 번째 후보(카드 출금 요일 변경)처럼 Injection 으로 표현되지 않는 상태 변경을 담는다:
 ```
-OverrideSpec = CARD_WITHDRAWAL_WEEKDAY { card_id: int, new_weekday: int }   // 0=월 … 6=일
+OverrideSpec = CARD_WITHDRAWAL_WEEKDAY { card_id: int, weekday: int }   // 0=월 … 6=일
 ```
 `cut_ratio`/`label` 은 어떤 `Injection`/`OverrideSpec` 타입에도 없는 부가 정보이므로 `AppliedAction` 래퍼에서만 붙인다(Injection·OverrideSpec 유니온 자체는 `extra="forbid"` 를 유지한다).
 
@@ -568,7 +572,7 @@ OverrideSpec = CARD_WITHDRAWAL_WEEKDAY { card_id: int, new_weekday: int }   // 0
               "effect":{"shortfall_prob":0.12,"delta":-0.19,"end_balance_median":1010000,"cost_of_action":"쇼핑 월 12만원 감소"},
               "feasibility_note":"이번 달 이미 사용 21만원, 남은 한도 7만원"},
              {"rank":2,
-              "actions":[{"override":{"type":"CARD_WITHDRAWAL_WEEKDAY","card_id":20,"new_weekday":2},
+              "actions":[{"override":{"type":"CARD_WITHDRAWAL_WEEKDAY","card_id":20,"weekday":2},
                           "label":"카드 출금 요일을 수요일로 변경"}],
               "effect":{"shortfall_prob":0.31,"delta":0.0,"end_balance_median":780000,"cost_of_action":"카드 출금일 이동"},
               "feasibility_note":"1차 항 동률, 기대 부족액 감소로 순위 결정(S56)"},
@@ -601,6 +605,8 @@ OverrideSpec = CARD_WITHDRAWAL_WEEKDAY { card_id: int, new_weekday: int }   // 0
 ```
 
 `meta.warnings` 는 `ResultWarning{code, message, details}` 의 배열이다. `code` 는 `W-*` 코드 문자열, `message` 는 사람이 읽는 설명, `details` 는 코드별 구조화 필드(자유 dict 가 아니라 각 `W-*` 코드가 정의한 키 집합)를 담는다.
+
+**결과 JSON 직렬화 규칙(QA-102).** 결과 JSON 은 alias 기준으로 직렬화한다(`by_alias`). Python 예약어(`from` 등)와 겹치는 필드는 코드에서 트레일링 언더스코어(`from_`)로 선언하되 alias 로 `from` 을 지정하고, 직렬화 시 반드시 그 alias 가 출력에 나가야 한다. 예: `FIXED_CHANGE` Injection 의 날짜 필드는 결과 JSON 에서 `from_` 이 아니라 `FIXED_CHANGE.from` 으로 나온다.
 
 `EngineError.code` 는 pydantic `ValidationError` 메시지를 파싱해서 채우지 않는다. 검증 지점에서 `FdtError(code=...)` 로 감싸 전달한 값을 그대로 옮긴다. pydantic 오류 메시지에는 코드 문자열이 포함되지만 메시지가 그 코드로 **시작함을 보장하지 않으므로**(필드명·위치가 앞에 붙는다) `startswith` 등으로 코드를 추출해서는 안 된다. 모든 검증 실패는 `FdtError(code)` 로 던지고, pydantic `ValidationError` 는 `extract_errors` 로 구조화한다(메시지 파싱 금지). 여러 파라미터·필드가 동시에 실패하면 전부 보고한다: `error.details.errors[]` 에 개별 실패를 나열한다(§8.1 참조).
 
@@ -715,7 +721,7 @@ fdt eval    backtest|calibration|monotonic|perf|all          # §12 기준 자�
 
 평가 도구: `fdt eval backtest|calibration|monotonic|perf|all`, 산출물 `data/eval/*.json`, `docs/EVAL_REPORT.md`.
 
-**백테스트 실측(2026-09-07, 5 시드, `docs/EVAL_REPORT.md`, S46·S48 반영 후).** sMAPE A .018 PASS, B .094(4/5 시드 통과), C .530(2/5 시드 통과, 기준 .40 초과, **FAIL**), D .012 PASS. 커버리지는 전 프로필에서 일부 시드가 기준(0.6~0.95, C 는 0.5~0.95) 을 벗어난다. 캘리브레이션 ECE `card_shortfall_prob` .024, `shortfall_prob` .031(둘 다 PASS). 단조성 위반 2/128건(전부 C 프로필). 성능 12 항목 전부 PASS(기준의 1/10 이하). C sMAPE FAIL 과 커버리지 이탈의 원인은 §14 R10(Behavior 90일 창의 추정 표본오차)으로 특정했다. **S49 적용 후 재측정 예정**(본 표의 수치는 S49 반영 전 측정값이다).
+**백테스트 실측(2026-09-07, 5 시드, `docs/EVAL_REPORT.md`, S46·S48·S49 반영 후, 창 180일 채택안).** sMAPE A .0145 PASS(5/5), B .0844 PASS(5/5 시드 통과, **커버리지도 5/5 로 처음 PASS**), C .569(2/5 시드 통과, 기준 .40 초과, **FAIL**), D .0101 PASS(5/5). 커버리지는 B 만 5/5 PASS 이고 A/C/D 는 일부 시드가 기준(0.6~0.95, C 는 0.5~0.95) 을 벗어난다(A 3/5, C 4/5, D 2/5). 캘리브레이션 ECE `card_shortfall_prob` .0195, `shortfall_prob` .0346(둘 다 PASS). 단조성 위반 1/128건(C 프로필). 성능 12 항목 전부 PASS(기준의 1/10 이하). C sMAPE FAIL 과 잔여 커버리지 이탈의 원인은 §14 R10(Behavior 창의 추정 표본오차, 창 확대로 부분 해소·잔여는 파라미터 부트스트랩 필요)으로 특정했다.
 
 ---
 
@@ -748,11 +754,12 @@ fdt eval    backtest|calibration|monotonic|perf|all          # §12 기준 자�
 | R7 | facts 와 viz 라벨 불일치 | `fdt validate` 가 annotations·caption 의 숫자를 facts 집합과 대조 |
 | R8 | 생성기·시뮬레이터 규칙 발산 | §7.2 를 정본으로 삼는다. 두 코드가 공유 상수 모듈을 쓰게 하고, §15.A 표를 두 코드 공통 테스트로 고정한다 |
 | R9 | C 프로필처럼 수입 간격이 짧은 사용자는 `payday_boost`/`pre_payday_damp` 신뢰구간이 넓다 | §6 겹침 규칙(수입 간격 < 12일 또는 불규칙 → `pre_payday_damp=1.0` 고정, `payday_boost` 는 급여 전 창 제외)으로 완화. 근본 해결은 v0.2 표본 확대·구간 추정 |
-| R10 | Behavior 추정 표본 오차(90일 창)가 A·D 커버리지 이탈과 D GOAL `achieve_prob` 분산의 직접 원인 | 적용(v0.7). 정량 근거: 90일 창에서 봉투별 건수 추정이 시드에 따라 ±26% 흩어져 30일 누적 소비가 0.74~1.10배로 갈리고, 이것이 A·D 커버리지 이탈과 D GOAL `achieve_prob` 0.006~0.983 분산의 직접 원인이다. §6 추정 창을 가용 이력 전체(상한 180일, 하한 28일)로 확대했다(S49). 표준오차를 `Behavior` 에 노출하거나 축소 추정(α=14)을 적용하는 안은 이번 판에 포함하지 않았다. L1 이 이를 추가 채택할 수 있으며, 그 결정은 L1 보고 후 다음 판에 반영한다 |
+| R10 | Behavior 추정 표본 오차(90일 창)가 A·D 커버리지 이탈과 D GOAL `achieve_prob` 분산의 직접 원인 | 창 180일 채택, daily_rate 축소 추정(α=14)은 측정 후 기각(D seed1 커버리지 악화, B 퇴행). 잔여 커버리지 이탈은 v0.2 파라미터 부트스트랩. 정량 근거: 90일 창에서 봉투별 건수 추정이 시드에 따라 ±26% 흩어져 30일 누적 소비가 0.74~1.10배로 갈리고, 이것이 A·D 커버리지 이탈과 D GOAL `achieve_prob` 0.006~0.983 분산의 직접 원인이다. §6 추정 창을 가용 이력 전체(상한 180일, 하한 28일)로 확대했다(S49). 축소 추정(α=14)은 L1 이 측정했으나 D seed1 커버리지가 0.233→0.067 로 악화하고 B 가 5/5→4/5 로 퇴행해 기각했다(근거 `docs/EVAL_REPORT.md` 변경 이력). 근본 해결(파라미터 자체의 표본 오차를 경로에 반영하는 부트스트랩)은 v0.2 로 이월한다 |
 | R11 | 커버리지 상한(.95) 초과 시드(A seed 1, D seed 7 등)는 밴드가 넓은 것이 아니라 정답 궤적이 좁게 예측 중심에 붙은 경우가 섞여 있어, 상한 기준의 타당성 자체를 재검토해야 한다 | 미결. 상한 기준의 타당성은 v0.2 에서 재검토 |
 | M1 | 확률 표기를 % 정수로 할지 소수로 할지 | 모드 내 통일만 강제. 에이전트 팀과 합의 후 고정 |
 | M2 | GOAL `SAVE` 타입의 "저축" 정의(비상금 이체 포함 여부) | v0.1: PRIMARY 잔액 증가분(economic 기준, S66)으로 정의 |
 | M3 | A 프로필이 `level: SAFE` 인데 `alerts` 에 `ACCELERATION` `WARNING` 이 동반될 수 있다(§8.5.2 가속도 판정과 §8.5 전체 `level` 산식이 서로 다른 신호를 본다). 현재 `Alert` 스키마에 이 불일치를 표시할 참고 필드가 없어 소비자가 모순으로 오해할 수 있다 | 미결(N5). Alert 에 `context`/`note` 같은 참고 표시 필드 추가 여부를 다음 리뷰에서 결정 |
+| M4 | 커버리지 상한 .95 기준 재검토(R11 연계) | 미결. §12 P10~P90 커버리지 상한 0.95 가 A seed 1·D seed 7 등 "정답 궤적이 좁게 예측 중심에 붙은" 경우까지 FAIL 처리하는 것이 타당한지 v0.2 에서 재검토 |
 
 ---
 
@@ -899,3 +906,15 @@ fdt eval    backtest|calibration|monotonic|perf|all          # §12 기준 자�
 | # | 요약 |
 | --- | --- |
 | S49 적용(v0.7) | S49 를 v0.2 이연에서 v0.1 로 앞당김. §6 Behavior 추정 창을 고정 `[as_of − 89, as_of]`(90일)에서 "가용 이력 전체, 상한 180일, 하한 28일(부족하면 있는 만큼)" 로 확대하고 `Behavior.window_days` 에 실제 값을 담도록 명시. §14 R10 을 "이연"에서 "적용(v0.7)"으로 갱신하고 R11(커버리지 상한 초과 시드의 원인이 밴드 과다가 아니라 정답 궤적 쏠림일 수 있다는 점, 상한 기준 타당성은 v0.2 재검토) 신설. §12 백테스트 메모를 `docs/EVAL_REPORT.md` 실측치(A .018 PASS, B .094 4/5, C .530 2/5 FAIL, D .012 PASS, 커버리지 전 프로필 일부 시드 이탈, 캘리브레이션 ECE .024/.031 PASS, 단조성 2/128 C 만, 성능 전부 PASS)로 갱신하고 S49 적용 후 재측정 예정임을 표기. 축소 추정(α=14)은 L1 보고 후 다음 판에 반영 예정으로 이번 판에서는 창 확대만 적용 |
+
+`docs/EVAL_REPORT.md`(변경 이력)·`docs/QA_REPORT.md` L1 결정·QA 결함 반영 내역 (v0.7 → v0.8)
+
+| # | 요약 |
+| --- | --- |
+| S49 L1 결정 반영(v0.8) | §6 S49 문단·§14 R10 을 "창 180일 채택, daily_rate 축소 추정(α=14)은 측정 후 기각(D seed1 커버리지 악화, B 퇴행). 잔여 커버리지 이탈은 v0.2 파라미터 부트스트랩" 으로 갱신(근거 `docs/EVAL_REPORT.md` 변경 이력) |
+| §12 재측정 반영 | §12 백테스트 메모를 `docs/EVAL_REPORT.md` 최신 수치(창 180: A .0145 PASS, B .0844 PASS·5/5 커버리지 PASS, C .569 FAIL, D .0101 PASS)로 갱신 |
+| QA-101 | §8.6 `OverrideSpec` 필드명을 코드와 같이 `weekday`(0..6) 로 통일(`new_weekday` 표기 수정) |
+| QA-102 | §9.1 에 "결과 JSON 은 alias 기준 직렬화(`by_alias`), 예: `FIXED_CHANGE.from`" 명시 |
+| QA-108 | §8.2 events 집계 규칙 추가: 불규칙 수입은 회차별 중앙값 예상일 1건, 카드대금은 카드·청구서별 예정 출금일 1건(fail_prob = 예정일 당일 실패 경로 비율), 재시도 성공은 나열하지 않음 |
+| QA-08/09 | §8.3 `WhatIfResult` 에 `branch_events[]`, `envelope_spend_median{base, branch}` 필드 추가 |
+| M4 신설 | §14 에 M4(커버리지 상한 .95 기준 재검토, R11 연계) 추가. M3 은 유지 |

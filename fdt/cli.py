@@ -373,7 +373,9 @@ def run_mode(
 
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
-            json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2),
+            # QA-102: by_alias=True 필요 - FixedChangeInjection.from_ 이
+            # SPEC 계약대로 "from" 키로 나가야 한다 (result.to_json_dict).
+            json.dumps(result.to_json_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 

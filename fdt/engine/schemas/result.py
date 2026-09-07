@@ -394,6 +394,20 @@ class WhatIfDelta(_Base):
     envelopes: list[EnvelopeDelta] = Field(default_factory=list)
 
 
+class EnvelopeSpendMedian(_Base):
+    """QA-09 확인 가능성(M2): 봉투별 지출 중앙값 한 벌.
+
+    `dict[envelope_id, int]` - `PathStats.envelope_spend_median` 을 그대로
+    옮긴다(재계산 없음). `EXTERNAL.price_index_mult` 같은 주입이 실제로
+    봉투별 지출에 준 영향을 base/branch 로 나란히 비교할 수 있게 한다(기존
+    `delta.envelopes[]` 는 주입이 직접 겨냥한 봉투만 담아 EXTERNAL 처럼
+    전 봉투에 걸치는 주입은 빈 배열이 되는 문제가 있었다, QA-09).
+    """
+
+    base: dict[int, int] = Field(default_factory=dict)
+    branch: dict[int, int] = Field(default_factory=dict)
+
+
 class WhatIfResult(_Base):
     base: BranchSummary
     branch: BranchSummary
@@ -404,6 +418,14 @@ class WhatIfResult(_Base):
     # 위험 수준을 분류한 값(§8.5.3 health 공식 재사용 여부는 J2 결정).
     # 옵션이라 기존 WHATIF 호출자는 영향받지 않는다.
     branch_level: Literal["SAFE", "WARNING", "DANGER"] | None = None
+    # QA-08 확인 가능성(M2): 분기 시나리오의 이벤트 목록(§8.2 `events` 와
+    # 같은 구조). `FIXED_CHANGE(cancel=true)` 로 고정비를 해지했을 때 그
+    # 이벤트가 분기에서 실제로 사라졌는지를 JSON 만으로 확인할 수 있게
+    # 한다(전에는 result 에 events 필드 자체가 없어 "확인 불가" 였다).
+    # 옵션 필드라 기존 WHATIF 호출자·직렬화 계약을 깨지 않는다.
+    branch_events: list[EventForecast] = Field(default_factory=list)
+    # QA-09 확인 가능성(M2): base/branch 각각의 봉투별 지출 중앙값.
+    envelope_spend_median: EnvelopeSpendMedian = Field(default_factory=EnvelopeSpendMedian)
 
 
 # ---------------------------------------------------------------------------
@@ -665,13 +687,28 @@ class EngineResult(_Base):
         return renderings
 
     def strip_volatile(self) -> dict[str, Any]:
-        """재현성 비교(골든 테스트)용 dump. elapsed_ms 를 제거한다."""
+        """재현성 비교(골든 테스트)용 dump. elapsed_ms 를 제거한다.
 
-        dumped = self.model_dump(mode="json")
+        `by_alias=True`(QA-102): `FixedChangeInjection.from_` 처럼 파이썬
+        예약어 회피용 별칭이 붙은 필드는 별칭(`from`)으로 직렬화해야
+        SPEC §8.3 계약과 일치한다. 별칭 없는 필드는 영향을 받지 않는다.
+        """
+
+        dumped = self.model_dump(mode="json", by_alias=True)
         meta = dumped.get("meta")
         if isinstance(meta, dict):
             meta.pop("elapsed_ms", None)
         return dumped
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """출력용 dict (CLI 저장 등). SPEC 계약 별칭(`from` 등)을 그대로 낸다
+
+        (QA-102). `by_alias=True` 가 없으면 `FixedChangeInjection.from_` 이
+        필드명 그대로 `"from_"` 로 새어나가 SPEC §8.3 의 `from` 계약을
+        어긴다.
+        """
+
+        return self.model_dump(mode="json", by_alias=True)
 
 
 __all__ = [
@@ -693,6 +730,7 @@ __all__ = [
     "EnvelopeCap",
     "EnvelopeDelta",
     "EnvelopeForecast",
+    "EnvelopeSpendMedian",
     "EventForecast",
     "EventPoint",
     "EventTimelineData",

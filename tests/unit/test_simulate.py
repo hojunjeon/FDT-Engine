@@ -310,8 +310,13 @@ def test_spec_15a_card_billing_cycle_hand_computed() -> None:
     events_by_date = {de.date: de.events for de in res.event_log}
     fail_event = next(e for e in events_by_date[date(2026, 9, 15)] if e.kind == "CARD_BILL")
     assert fail_event.success_ratio == 0.0
-    success_event = next(e for e in events_by_date[date(2026, 9, 16)] if e.kind == "CARD_BILL")
-    assert success_event.success_ratio == 1.0
+    # QA-108(b): FORECAST events 는 카드별 예정 출금일(첫 시도일) 1건만
+    # 낸다. 9/16 은 밀린 청구서의 재시도 성공일이라 events 에 나오지
+    # 않는다(재시도 성공/실패는 별도 이벤트로 나열하지 않는다) - 대신
+    # `res.payment_risks()`(아래) 가 그 결제가 결국 실패했다는 사실을 담는다.
+    assert not any(
+        e.kind == "CARD_BILL" for e in events_by_date.get(date(2026, 9, 16), [])
+    )
 
     risks = {(r.due, r.kind): r for r in res.payment_risks()}
     first_bill = risks[(date(2026, 9, 8), "CARD_BILL")]

@@ -203,7 +203,7 @@
 
 검토 포인트: viz 에 색상·픽셀·라이브러리명이 없는가. facts 의 확률 단위가 모드 내 통일인가(M1).
 
-### Phase 7. 평가와 QA 마감 (D15 ~ D18) [평가 도구 완료, 기준 미달 항목 원인 분석 진행 중]
+### Phase 7. 평가와 QA 마감 (D15 ~ D18) [재평가 완료(S49), 골든 스냅샷·최종 리뷰 남음]
 
 산출물
 - `eval/backtest.py`(sMAPE, 최저점 오차, 커버리지), `eval/calibration.py`(ECE, Brier, 구간 표본), `eval/monotonic.py`, `eval/report.py`(마크다운 표).
@@ -235,7 +235,7 @@
 | W12 validate·render | `tools/*`, `test_validate_render.py` | W11 | 1.5일 | 완료 |
 | W13 속성·골든·통합 | `tests/property`, `tests/golden`, `tests/integration` | W7~W12 | 1.5일 | 골든 제외 완료 |
 | W14 평가 | `eval/*` | W7 (backtest·calibration), W8 (monotonic) | 2일 | 완료 |
-| W15 QA·문서 | `docs/QA_REPORT.md`, `README.md`, `docs/reviews/` | 전부 | 1.5일 | 진행 중(QA·README L2) |
+| W15 QA·문서 | `docs/QA_REPORT.md`, `README.md`, `docs/reviews/` | 전부 | 1.5일 | QA 1차 완료(결함 8건 → 수정 중 M1/M2) |
 
 병렬 규칙
 - 함수 시그니처는 SPEC 이 계약이다. 시그니처를 바꾸려면 SPEC 수정 커밋을 먼저 낸다.
@@ -425,6 +425,8 @@ QA 마감 전, SPEC §3.3, §8.1~8.6, §9.4, §12 의 표를 한 줄씩 체크�
 
 여유 2일(D18~D20)은 평가 미달 원인 분석과 SPEC v0.2 항목(급여 주기 앵커, 수입 간격 분포) 정리에 쓴다.
 
+실제 진행: D0 하루에 Phase 0~7 1차 완료(에이전트 병렬), 리뷰 4회.
+
 ---
 
 ## 10. 리스크와 대응 (계획 관점)
@@ -458,5 +460,5 @@ QA 마감 전, SPEC §3.3, §8.1~8.6, §9.4, §12 의 표를 한 줄씩 체크�
 - [x] `schemas/*.schema.json` 내보내기 (W0 완료)
 - [ ] `data/seed/` 4 프로필, `tests/golden/` 20개: seed 4 프로필 완료, 골든 스냅샷 20개는 미완료(W13, 골든 제외)
 - [ ] `pytest -q` 통과, 커버리지 ≥ 85% (미확정, 골든 미완료로 W13 진행 중)
-- [x] `docs/EVAL_REPORT.md`, `docs/QA_REPORT.md`, `docs/reviews/` 3회 전체 리뷰: 리뷰 문서 4건 기록됨(`20260907_W0`, `_W1_W2`, `_W3_W4_W5`, `_W6_W10`), `EVAL_REPORT.md` 작성 완료(W14), `QA_REPORT.md` 는 미작성(W15)
-- [ ] `README.md`: 설치, `gen → build → run → validate → render` 5분 안내, 모드별 요청 예시 5개 (W15 미착수)
+- [x] `docs/EVAL_REPORT.md`, `docs/QA_REPORT.md`, `docs/reviews/` 3회 전체 리뷰: 리뷰 문서 4건 기록됨(`20260907_W0`, `_W1_W2`, `_W3_W4_W5`, `_W6_W10`), `EVAL_REPORT.md` 작성 완료(W14), `QA_REPORT.md` 작성 완료(W15, QA-01~20 + 결함 8건)
+- [x] `README.md`: 설치, `gen → build → run → validate → render` 5분 안내, 모드별 요청 예시 5개 (W15 완료)

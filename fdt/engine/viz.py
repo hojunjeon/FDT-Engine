@@ -90,6 +90,21 @@ def _envelope_name(envelope_id: int) -> str:
     return f"봉투{envelope_id}"
 
 
+def _josa(word: str, suffix: str = "이다") -> str:
+    """서술격 조사 처리 (QA-105).
+
+    caption 이 facts 표기(숫자+단위, 예: "181,100원", "37%", "13점") 뒤에
+    구어체로 "다" 를 그냥 붙이면 "181,100원다." 처럼 비문이 된다. 숫자·
+    '원'·'%'·'점' 등으로 끝나는 표기 뒤는 "이다" 가 맞고, 그 외 표기(예:
+    "OK", "SAFE" 같은 영문 판정어)도 이 구현에서는 받침 유무를 따지지
+    않고 "이다" 로 통일한다(간단하고 전부 자연스럽다 - 영문 약어도
+    "OK이다"/"SAFE이다" 로 무리 없이 읽힌다). `word` 인자는 향후 받침별
+    분기가 필요해질 때를 위해 시그니처에 남겨둔다.
+    """
+
+    return suffix
+
+
 def _joined_action_label(actions: list[Any], rank: int) -> str:
     """조합 후보 라벨을 이어붙인다 (B8, `facts.py` 의 같은 이름 함수와 규칙
     동일 - `ra.actions[0].label` 만 읽으면 2 행동 조합이 1위와 같은 라벨로
@@ -132,7 +147,8 @@ def _viz_forecast(
         ],
         caption=(
             f"말일 예상 잔액은 {_render(facts_by_key, 'end_balance_median')}, "
-            f"부족 확률은 {_render(facts_by_key, 'shortfall_prob')}다."
+            f"부족 확률은 {_render(facts_by_key, 'shortfall_prob')}"
+            f"{_josa(_render(facts_by_key, 'shortfall_prob'))}."
         ),
     )
 
@@ -214,7 +230,8 @@ def _viz_whatif(
         ],
         caption=(
             f"판정은 {_render(facts_by_key, 'verdict')}, "
-            f"최저 잔액 변화는 {_render(facts_by_key, 'delta_min_balance')}다."
+            f"최저 잔액 변화는 {_render(facts_by_key, 'delta_min_balance')}"
+            f"{_josa(_render(facts_by_key, 'delta_min_balance'))}."
         ),
     )
 
@@ -247,7 +264,10 @@ def _viz_whatif(
                 ),
             ]
         ),
-        caption=f"부족 확률 변화는 {_render(facts_by_key, 'delta_shortfall_prob')}다.",
+        caption=(
+            f"부족 확률 변화는 {_render(facts_by_key, 'delta_shortfall_prob')}"
+            f"{_josa(_render(facts_by_key, 'delta_shortfall_prob'))}."
+        ),
     )
 
     return [line_band, delta_bars]
@@ -285,7 +305,10 @@ def _viz_goal(
             level=_goal_level(result.achieve_prob),
         ),
         encoding=GaugeEncoding(unit="%"),
-        caption=f"목표 달성 확률은 {_render(facts_by_key, 'achieve_prob')}다.",
+        caption=(
+            f"목표 달성 확률은 {_render(facts_by_key, 'achieve_prob')}"
+            f"{_josa(_render(facts_by_key, 'achieve_prob'))}."
+        ),
     )
 
     week_dates = [wc.week_start for wc in result.weekly_caps]
@@ -312,7 +335,10 @@ def _viz_goal(
             stacks=stacks,
             total=[float(wc.total_cap) for wc in result.weekly_caps],
         ),
-        caption=f"지출 축소 비율은 {_render(facts_by_key, 'reduction_ratio')}다.",
+        caption=(
+            f"지출 축소 비율은 {_render(facts_by_key, 'reduction_ratio')}"
+            f"{_josa(_render(facts_by_key, 'reduction_ratio'))}."
+        ),
     )
 
     # GoalResult 에는 잔액 궤적이 없어(SPEC 8.4), line_band 는 주차 누적 상한을
@@ -354,7 +380,10 @@ def _viz_goal(
             band=LineBand(lower=line_y, upper=line_y),
         ),
         annotations=goal_line_annotations,
-        caption=f"부족액(중앙값)은 {_render(facts_by_key, 'gap_median')}다.",
+        caption=(
+            f"부족액(중앙값)은 {_render(facts_by_key, 'gap_median')}"
+            f"{_josa(_render(facts_by_key, 'gap_median'))}."
+        ),
     )
 
     return [gauge, step_bars, line_band]
@@ -422,7 +451,10 @@ def _viz_risk(
             rows=rows,
         ),
         annotations=annotations,
-        caption=f"오늘 안심 소비 한도는 {_render(facts_by_key, 'safe_to_spend_today')}다.",
+        caption=(
+            f"오늘 안심 소비 한도는 {_render(facts_by_key, 'safe_to_spend_today')}"
+            f"{_josa(_render(facts_by_key, 'safe_to_spend_today'))}."
+        ),
     )
 
     # RiskResult 에는 별도 events 목록이 없어(SPEC 8.5), payment_risks 를
@@ -443,7 +475,10 @@ def _viz_risk(
                 for pr in result.payment_risks
             ]
         ),
-        caption=f"예상 부족액은 {_render(facts_by_key, 'expected_shortfall')}다.",
+        caption=(
+            f"예상 부족액은 {_render(facts_by_key, 'expected_shortfall')}"
+            f"{_josa(_render(facts_by_key, 'expected_shortfall'))}."
+        ),
     )
 
     return [gauge, table, event_timeline]
@@ -497,7 +532,10 @@ def _viz_optimize(
         title="행동 후보 효과 순위",
         priority=1,
         data=RankedBarsData(items=items),
-        caption=f"1위 행동은 {_render(facts_by_key, 'top_action_label')}다.",
+        caption=(
+            f"1위 행동은 {_render(facts_by_key, 'top_action_label')}"
+            f"{_josa(_render(facts_by_key, 'top_action_label'))}."
+        ),
     )
 
     baseline_pct = round(result.baseline.shortfall_prob * 100)
@@ -521,7 +559,10 @@ def _viz_optimize(
         title="권장 조합 효과",
         priority=1,
         data=DeltaBarsData(items=delta_items),
-        caption=f"기준 부족 확률은 {_render(facts_by_key, 'baseline_shortfall_prob')}다.",
+        caption=(
+            f"기준 부족 확률은 {_render(facts_by_key, 'baseline_shortfall_prob')}"
+            f"{_josa(_render(facts_by_key, 'baseline_shortfall_prob'))}."
+        ),
     )
 
     return [ranked_bars, delta_bars]

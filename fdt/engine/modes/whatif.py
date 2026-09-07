@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from fdt.engine.modes import register
 from fdt.engine.modes._common import (
+    events_from,
     level_from_probs,
     make_context,
     point_stats,
@@ -35,6 +36,7 @@ from fdt.engine.schemas.request import ModeRequest, WhatIfParams
 from fdt.engine.schemas.result import (
     BranchSummary,
     EnvelopeDelta,
+    EnvelopeSpendMedian,
     FirstShortfallDate,
     TrajectorySummary,
     WhatIfDelta,
@@ -209,6 +211,15 @@ def run_whatif(engine, req: ModeRequest) -> WhatIfResult:
         branch_stats.shortfall_prob, branch_stats.card_shortfall_prob
     )
 
+    # QA-08/QA-09 확인 가능성(M2): 분기 이벤트·봉투별 지출 중앙값을 result 에
+    # 노출한다 - `events_from`/`PathStats.envelope_spend_median` 은 이미
+    # 계산돼 있는 값을 그대로 옮기는 것이라 재계산이 아니다.
+    branch_events = events_from(branch_sim, as_of=ctx.state.as_of)
+    envelope_spend_median = EnvelopeSpendMedian(
+        base=dict(base_stats.envelope_spend_median),
+        branch=dict(branch_stats.envelope_spend_median),
+    )
+
     return WhatIfResult(
         base=base_summary,
         branch=branch_summary,
@@ -216,4 +227,6 @@ def run_whatif(engine, req: ModeRequest) -> WhatIfResult:
         verdict=verdict,  # type: ignore[arg-type]
         branch_level=branch_level,  # type: ignore[arg-type]
         crn=True,
+        branch_events=branch_events,
+        envelope_spend_median=envelope_spend_median,
     )

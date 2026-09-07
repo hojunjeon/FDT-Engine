@@ -574,6 +574,43 @@ def simulate(
     payment_records: list[dict[str, Any]] = []
     pending_bill_records: list[dict[str, Any]] = []
 
+    # QA-108(b): 시뮬 시작 시점에 이미 청구서가 발행돼 있던 상태
+    # (`CardState.issued_unpaid`, as_of 스냅샷)도 "카드별 예정 출금일 1건"
+    # 규칙을 똑같이 적용해야 한다 - 이 배치는 위 카드 초기화 루프에서
+    # `pending_amt`/`pending_due` 에만 채워지고 `pending_bill_records` 에는
+    # 없어서, 이 등록이 없으면 첫 출금(성공이든 실패든)이 FORECAST
+    # `events[]` 에 전혀 안 잡힌다. `synthetic_forecast_only=True` 로 표시해
+    # `payment_records`(§8.5 RISK `payment_risks()` 의 원천)에는 더하지
+    # 않는다 - RISK 는 이 초기 잔여 청구서를 이미 다른 경로(`unbilled`/
+    # `issued_unpaid` 상태 자체)로 다루고 있어, 여기서 새로 payment_records
+    # 항목을 만들면 RISK 쪽 결과가 이 수정과 무관하게 바뀐다(범위 밖). 예정일이
+    # 이미 as_of 이전/당일이면(이미 밀린 청구서) 시뮬레이터가 실제로 시도하는
+    # 첫날(k=1)로 당겨 이벤트를 낸다 - 과거 날짜에 이벤트를 낼 수는 없다.
+    for ci, c in enumerate(cards):
+        for billing in sorted(c.issued_unpaid, key=lambda b: b.billing_date):
+            first_due = _first_weekday_on_or_after(billing.billing_date, card_weekday[ci])
+            due_clipped = first_due if first_due > as_of else as_of + timedelta(days=1)
+            pending_bill_records.append(
+                {
+                    "card_id": c.id,
+                    "name": f"카드대금 {c.card_name}",
+                    "due": due_clipped,
+                    "amounts": np.full(n_paths, billing.amount, dtype=np.int64),
+                    "has_bill": np.ones(n_paths, dtype=bool),
+                    "synthetic_forecast_only": True,
+                }
+            )
+
+    # QA-108(a): 불규칙 수입은 경로마다 입금일이 흔들려(위 S48 설명) 하루
+    # 루프 안에서 그대로 이벤트를 쌓으면 거의 매일 INCOME 이벤트가 생긴다.
+    # 대신 경로별 "몇 번째 입금인지" 카운터(`path_income_count`)와 그 날의
+    # 순서(ordinal)만 회차별로 모아뒀다가(`income_occurrence_days`), 루프가
+    # 끝난 뒤 회차마다 경로들의 날짜 중앙값 하루에만 이벤트 1건을 만든다
+    # (오케스트레이터 결정. 규칙적 수입은 애초에 전 경로가 같은 날 입금돼
+    # 이미 회차당 1건이라 이 경로를 타지 않는다).
+    income_occurrence_days: dict[int, list[int]] = {}
+    path_income_count = np.zeros(n_paths, dtype=np.int64) if irregular_income else None
+
     balances[:, 0] = liquidity
     economic[:, 0] = (
         liquidity - _issued_unpaid_sum() - unpaid_obligation_cum - suppressed_demand_cum
@@ -606,14 +643,13 @@ def simulate(
                 amounts = np.round(income.expected * growth_mult * noise).astype(np.int64)
                 liquidity[due_mask] += amounts
                 last_income_ord[due_mask] = d_ord
-                day_events.append(
-                    Event(
-                        kind="INCOME",
-                        name="수입",
-                        amount=round(float(np.median(amounts))),
-                        success_ratio=1.0,
-                    )
-                )
+                # QA-108(a): 여기서 바로 이벤트를 만들지 않는다(위 설명) -
+                # 회차(occurrence)별 날짜만 모아 루프 종료 후 집계한다.
+                assert path_income_count is not None
+                due_idx = np.nonzero(due_mask)[0]
+                for occurrence in path_income_count[due_idx].tolist():
+                    income_occurrence_days.setdefault(occurrence, []).append(d_ord)
+                path_income_count[due_idx] += 1
                 # 생성기와 동일 분포: actual_gap = max(3, round(gap + N(0, 0.3*gap)))
                 gap = income.median_gap_days
                 assert gap is not None  # irregular_income 조건이 이미 보장
@@ -711,8 +747,6 @@ def simulate(
         # 4. 카드 출금 (예정 출금일 이후 매일 재시도, 실패 시 그 카드 중단) --
         for ci, card in enumerate(cards):
             failed_today = np.zeros(n_paths, dtype=bool)
-            attempted_today = np.zeros(n_paths, dtype=bool)
-            attempted_amt = np.zeros(n_paths, dtype=np.int64)
             for _pass in range(pending_cap[ci] + 1):
                 cnt = pending_count[ci]
                 active = cnt > 0
@@ -723,11 +757,6 @@ def simulate(
                 attempt = active & (due0 <= d_ord) & (~failed_today)
                 if not attempt.any():
                     break
-                # amt0 는 이번 패스에서 시도되는 금액의 스냅샷이다 - 지불 후
-                # 배열을 왼쪽으로 밀면(shift) slot0 값이 바뀌므로, 로깅용
-                # 금액은 밀기 전에 여기서 기록해 둔다.
-                attempted_amt[attempt] = amt0[attempt]
-                attempted_today |= attempt
                 afford = liquidity >= amt0
                 pay_mask = attempt & afford
                 fail_mask = attempt & ~afford
@@ -743,17 +772,13 @@ def simulate(
                     card_shortfall[fail_mask] = True
                 if not pay_mask.any():
                     break
-            if attempted_today.any():
-                sr = float((attempted_today & ~failed_today).sum() / attempted_today.sum())
-                day_events.append(
-                    Event(
-                        kind="CARD_BILL",
-                        name=f"카드대금 {card.card_name}",  # S47/N2: 큐와 이름 통일
-                        amount=round(float(np.median(attempted_amt[attempted_today]))),
-                        success_ratio=sr,
-                        source_card_id=card.id,
-                    )
-                )
+            # QA-108(b): 예전에는 `attempted_today.any()`(재시도까지 포함해
+            # 밀린 청구서가 남아있는 한 매일 참) 기준으로 CARD_BILL 이벤트를
+            # 매일 만들어, FORECAST `events[]` 가 거의 매일 카드대금을
+            # 나열했다(결함 QA-108). 이제 FORECAST 이벤트는 카드별 **예정
+            # 출금일(첫 시도일) 1건**만 만든다 - 아래 `resolved`(그 배치의
+            # 예정일이 오늘인 건) 루프에서 `payment_records` 와 같은 소스로
+            # 만든다(재시도 성공/실패는 별도 이벤트로 나열하지 않는다).
 
             resolved = [
                 r for r in pending_bill_records if r["card_id"] == card.id and r["due"] == d
@@ -765,17 +790,31 @@ def simulate(
                 fail_mask_r = still_present & has_bill_mask
                 fail_prob = float(fail_mask_r.sum() / n_has) if n_has else 0.0
                 amount_repr = round(float(np.median(r["amounts"][has_bill_mask]))) if n_has else 0
-                payment_records.append(
-                    {
-                        "due": d,
-                        "kind": "CARD_BILL",
-                        "name": r["name"],
-                        "amount": amount_repr,
-                        "fail_prob": fail_prob,
-                        "median_balance_before": round(float(np.median(balances[:, k - 1]))),
-                        "source_card_id": r["card_id"],
-                    }
-                )
+                if not r.get("synthetic_forecast_only"):
+                    payment_records.append(
+                        {
+                            "due": d,
+                            "kind": "CARD_BILL",
+                            "name": r["name"],
+                            "amount": amount_repr,
+                            "fail_prob": fail_prob,
+                            "median_balance_before": round(float(np.median(balances[:, k - 1]))),
+                            "source_card_id": r["card_id"],
+                        }
+                    )
+                if n_has:
+                    # `fail_prob` 은 "예정일 당일 실패 비율"이다(오케스트레이터
+                    # 결정, docstring 명시 - QA-108(b)). 말일까지 미결제로
+                    # 남는 비율은 이 이벤트에 넣지 않고 facts(§9.2)로만 낸다.
+                    day_events.append(
+                        Event(
+                            kind="CARD_BILL",
+                            name=r["name"],
+                            amount=amount_repr,
+                            success_ratio=1.0 - fail_prob,
+                            source_card_id=r["card_id"],
+                        )
+                    )
             if resolved:
                 pending_bill_records = [
                     r
@@ -1018,6 +1057,32 @@ def simulate(
         newly_short = day_short & (~any_shortfall)
         first_shortfall_idx[newly_short] = k
         any_shortfall |= day_short
+
+    if income_occurrence_days:
+        # QA-108(a): 회차별 경로들의 입금일 중앙값 하루에 INCOME 이벤트
+        # 1건만 만든다. 금액은 실현 잡음이 아니라 기대치(expected)를 쓴다
+        # (오케스트레이터 결정 - "회차/기대치" 는 실현 금액 분포가 아니라
+        # 예정된 수입 일정을 보여주는 용도라서다). 다만 horizon 끝에
+        # 가까운 회차는 "실제로 빨리 입금된 소수 경로"만 그 회차에 도달해
+        # (간격 잡음 sigma=0.3*gap) 표본이 얇은 채로 중앙값을 낸다 - 그대로
+        # 두면 다수결이 아닌 꼬리 표본이 이벤트를 만들어 horizon 끝자락에
+        # 가짜 이벤트가 몰린다. 그 회차에 실제로 도달한 경로가 **과반**일
+        # 때만 이벤트로 승격한다(경로 절반 이상이 그 회차 수입을 받았다고
+        # 볼 수 있을 때만 "예정된 수입"으로 표시).
+        expected_amount = round(income.expected)
+        first_ord = dates[1].toordinal()
+        last_ord = dates[-1].toordinal()
+        majority = n_paths / 2
+        for occurrence in sorted(income_occurrence_days):
+            day_ords = income_occurrence_days[occurrence]
+            if len(day_ords) < majority:
+                continue
+            median_ord = round(float(np.median(day_ords)))
+            median_ord = min(max(median_ord, first_ord), last_ord)
+            k_evt = median_ord - as_of.toordinal()
+            events_by_day.setdefault(k_evt, []).append(
+                Event(kind="INCOME", name="수입", amount=expected_amount, success_ratio=1.0)
+            )
 
     event_log = [DayEvents(date=dates[k], events=events_by_day[k]) for k in sorted(events_by_day)]
 

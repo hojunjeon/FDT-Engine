@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import warnings
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ import matplotlib.pyplot as plt
 from fdt.engine.errors import E_REQ_INVALID, FdtError
 from fdt.engine.schemas.result import (
     DeltaBarsViz,
+    DeltaItem,
     EngineResult,
     EventTimelineViz,
     GaugeViz,
@@ -41,6 +43,20 @@ from fdt.engine.schemas.result import (
 __all__ = ["render_result", "render_viz"]
 
 _KOREAN_FONT_CANDIDATES = ("Malgun Gothic", "AppleGothic", "NanumGothic", "Noto Sans CJK KR")
+
+# QA-104: event_timeline 의 `kind` 범례용 고정 팔레트(질적 색상, 10 색 순환).
+_KIND_PALETTE = (
+    "#4C72B0",
+    "#DD8452",
+    "#55A868",
+    "#C44E52",
+    "#8172B2",
+    "#937860",
+    "#DA8BC3",
+    "#8C8C8C",
+    "#CCB974",
+    "#64B5CD",
+)
 
 
 def _configure_korean_font() -> None:
@@ -113,29 +129,131 @@ def _render_line_band(viz: LineBandViz, out_path: Path) -> None:
     plt.close(fig)
 
 
-def _render_event_timeline(viz: EventTimelineViz, out_path: Path) -> None:
-    events = viz.data.events
-    fig, ax = plt.subplots(figsize=(8, 3.5))
+# ---------------------------------------------------------------------------
+# event_timeline (QA-104: 실제 날짜 x축 + 이벤트 밀집 시 라벨 정리)
+# ---------------------------------------------------------------------------
+
+
+def _build_event_timeline_fig(viz: EventTimelineViz) -> plt.Figure:
+    events = list(viz.data.events)
+    fig, ax = plt.subplots(figsize=(9, 4.2))
+
     if events:
-        xs = list(range(len(events)))
+        base_date = min(e.date for e in events)
+
+        # 같은 날짜에 여러 이벤트가 있으면 세로로 스택해 겹침을 피한다.
+        by_date: dict[date, list[int]] = {}
+        for i, e in enumerate(events):
+            by_date.setdefault(e.date, []).append(i)
+
+        x_by_idx = [0] * len(events)
+        y_by_idx = [0] * len(events)
+        for d, idxs in by_date.items():
+            offset = (d - base_date).days
+            for stack_pos, i in enumerate(idxs):
+                x_by_idx[i] = offset
+                y_by_idx[i] = stack_pos
+
         amounts = [e.amount for e in events]
         max_amount = max(amounts) if max(amounts) > 0 else 1
         sizes = [30 + 400 * (a / max_amount) for a in amounts]
-        colors = [e.fail_prob for e in events]
-        scatter = ax.scatter(xs, [0] * len(xs), s=sizes, c=colors, cmap="Greys", vmin=0, vmax=1)
-        for x, e in zip(xs, events, strict=True):
+        fail_probs = [e.fail_prob for e in events]
+
+        # 색은 계속 fail_prob 회색조(§9.3 encoding.color)로 유지하고,
+        # kind 구분은 마커 테두리 색 + 범례로 별도 인코딩한다.
+        kinds = sorted({e.kind for e in events})
+        kind_color = {k: _KIND_PALETTE[i % len(_KIND_PALETTE)] for i, k in enumerate(kinds)}
+        edgecolors = [kind_color[e.kind] for e in events]
+
+        scatter = ax.scatter(
+            x_by_idx,
+            y_by_idx,
+            s=sizes,
+            c=fail_probs,
+            cmap="Greys",
+            vmin=0,
+            vmax=1,
+            edgecolors=edgecolors,
+            linewidths=1.8,
+            zorder=3,
+        )
+
+        # 이벤트가 8개 이상이면 fail_prob 상위 5개만 텍스트 라벨을 달고
+        # 나머지는 점만 남긴다(겹침 방지). 그 미만이면 전부 라벨을 단다.
+        if len(events) >= 8:
+            label_idx = set(
+                sorted(range(len(events)), key=lambda i: events[i].fail_prob, reverse=True)[:5]
+            )
+        else:
+            label_idx = set(range(len(events)))
+
+        # 라벨을 x 위치 순으로 훑으면서, 바로 앞 라벨과 x 가 가까우면
+        # 세로 단(段)을 하나씩 올려 텍스트가 옆 라벨과 겹치지 않게 한다.
+        _LABEL_X_GAP_THRESHOLD = 6  # 일 단위, 이보다 가까우면 층을 바꾼다
+        _LABEL_MAX_TIERS = 3
+        _LABEL_TIER_STEP = 46  # pt, 층 사이 간격(폰트 2줄 높이보다 넉넉하게)
+        last_x: int | None = None
+        tier = 0
+        for i in sorted(label_idx, key=lambda i: x_by_idx[i]):
+            e = events[i]
+            if last_x is not None and abs(x_by_idx[i] - last_x) < _LABEL_X_GAP_THRESHOLD:
+                tier = (tier + 1) % _LABEL_MAX_TIERS
+            else:
+                tier = 0
+            last_x = x_by_idx[i]
             ax.annotate(
-                f"{e.name}\n{e.date.isoformat()}",
-                (x, 0),
+                f"{e.name}\n{e.date.strftime('%m-%d')}",
+                (x_by_idx[i], y_by_idx[i]),
                 textcoords="offset points",
-                xytext=(0, 12),
+                xytext=(0, 12 + 9 * y_by_idx[i] + _LABEL_TIER_STEP * tier),
                 ha="center",
                 fontsize=7,
             )
-        fig.colorbar(scatter, ax=ax, label="fail_prob", shrink=0.6)
+
+        unique_dates = sorted(by_date.keys())
+        step = max(1, len(unique_dates) // 8)
+        tick_dates = unique_dates[::step]
+        ax.set_xticks([(d - base_date).days for d in tick_dates])
+        ax.set_xticklabels(
+            [d.strftime("%m-%d") for d in tick_dates], rotation=45, ha="right", fontsize=7
+        )
+        ax.set_xlabel("날짜 (월-일)")
         ax.set_yticks([])
+        max_stack = max(y_by_idx) if y_by_idx else 0
+        ax.set_ylim(-0.6, max_stack + 1.4)
+
+        fig.colorbar(scatter, ax=ax, label="fail_prob", shrink=0.6)
+
+        legend_handles = [
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="",
+                markerfacecolor="none",
+                markeredgecolor=kind_color[k],
+                markeredgewidth=1.8,
+                markersize=8,
+                label=k,
+            )
+            for k in kinds
+        ]
+        ax.legend(
+            handles=legend_handles,
+            fontsize=7,
+            loc="upper left",
+            bbox_to_anchor=(1.15, 1.0),
+            title="kind",
+            title_fontsize=7,
+        )
+
     _wrap_caption(fig, viz.title, viz.caption)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.9))
+    fig.tight_layout(rect=(0, 0.04, 0.82, 0.9))
+    return fig
+
+
+def _render_event_timeline(viz: EventTimelineViz, out_path: Path) -> None:
+    fig = _build_event_timeline_fig(viz)
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
 
@@ -195,18 +313,54 @@ def _render_progress_bars(viz: ProgressBarsViz, out_path: Path) -> None:
     plt.close(fig)
 
 
-def _render_delta_bars(viz: DeltaBarsViz, out_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# delta_bars (QA-107: 단위별 서브플롯으로 분리)
+# ---------------------------------------------------------------------------
+
+
+def _build_delta_bars_fig(viz: DeltaBarsViz) -> plt.Figure:
     items = viz.data.items
-    fig, ax = plt.subplots(figsize=(7, max(2.5, 0.6 * len(items))))
-    ys = list(range(len(items)))
-    width = 0.35
-    ax.barh([y + width / 2 for y in ys], [it.base for it in items], height=width, label="기준")
-    ax.barh([y - width / 2 for y in ys], [it.branch for it in items], height=width, label="분기")
-    ax.set_yticks(ys)
-    ax.set_yticklabels([it.name for it in items], fontsize=9)
-    ax.legend(fontsize=8)
+
+    groups: dict[str, list[DeltaItem]] = {}
+    for it in items:
+        groups.setdefault(it.unit, []).append(it)
+    unit_keys = list(groups.keys())
+    n_rows = max(1, len(unit_keys))
+
+    row_heights = [max(1.6, 0.6 * len(groups[u]) + 0.8) for u in unit_keys] or [2.5]
+    fig, axes = plt.subplots(n_rows, 1, figsize=(7, sum(row_heights)), squeeze=False)
+    axes_flat = list(axes[:, 0])
+
+    for ax, unit in zip(axes_flat, unit_keys, strict=False):
+        group_items = groups[unit]
+        ys = list(range(len(group_items)))
+        width = 0.35
+        ax.barh(
+            [y + width / 2 for y in ys],
+            [it.base for it in group_items],
+            height=width,
+            label="기준",
+            color="#4C72B0",
+        )
+        ax.barh(
+            [y - width / 2 for y in ys],
+            [it.branch for it in group_items],
+            height=width,
+            label="분기",
+            color="#DD8452",
+        )
+        ax.set_yticks(ys)
+        ax.set_yticklabels([it.name for it in group_items], fontsize=9)
+        ax.set_xlabel(f"단위: {unit}" if unit else "값")
+        ax.legend(fontsize=8)
+
     _wrap_caption(fig, viz.title, viz.caption)
     fig.tight_layout(rect=(0, 0.04, 1, 0.9))
+    return fig
+
+
+def _render_delta_bars(viz: DeltaBarsViz, out_path: Path) -> None:
+    fig = _build_delta_bars_fig(viz)
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
 
@@ -229,33 +383,100 @@ def _render_step_bars(viz: StepBarsViz, out_path: Path) -> None:
     plt.close(fig)
 
 
-def _render_ranked_bars(viz: RankedBarsViz, out_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# ranked_bars (QA-106: 단위별 표기 분기 + 순위-길이 일관성)
+# ---------------------------------------------------------------------------
+
+
+def _format_effect(value: float, unit: str) -> str:
+    """부호 있는 effect 값을 unit 에 맞춰 사람이 읽을 문자열로 만든다.
+
+    확률 차원(`%`/`prob`)은 소수 첫째 자리 `%`, KRW 차원은 천단위 콤마 +
+    "원". 그 외 단위는 값 뒤에 그대로 붙인다. 부호는 항상 라벨에 표시하고
+    (막대 길이 자체는 절대값을 쓰므로) 방향은 여기서만 드러난다.
+    """
+
+    sign = "+" if value >= 0 else "-"
+    av = abs(value)
+    if unit in ("%", "prob"):
+        return f"{sign}{av:.1f}%"
+    if unit == "KRW":
+        return f"{sign}{av:,.0f}원"
+    if unit:
+        return f"{sign}{av:g}{unit}"
+    return f"{sign}{av:g}"
+
+
+def _build_ranked_bars_fig(viz: RankedBarsViz) -> plt.Figure:
     items = sorted(viz.data.items, key=lambda it: it.rank)
     fig, ax = plt.subplots(figsize=(7, max(2.5, 0.5 * len(items))))
     ys = list(range(len(items)))
-    ax.barh(ys, [it.effect for it in items], color="#4C72B0")
+
+    # 막대 길이는 항상 절대값을 쓴다(개선 방향이 음수인 차원도 길이로는
+    # 비교 가능하게 하고, 부호·방향은 라벨과 막대 색으로만 구분한다).
+    # 순위(`rank`)는 이미 정렬 순서를 결정하므로, 여기서 뒤집는 y축과
+    # 함께 1위가 맨 위/가장 두드러진 위치에 오도록만 하고 막대 길이 자체를
+    # 임의로 재조정하지 않는다(각 항목의 실제 효과 크기를 왜곡 없이 반영).
+    lengths = [abs(it.effect) for it in items]
+    colors = ["#C44E52" if it.effect < 0 else "#4C72B0" for it in items]
+    ax.barh(ys, lengths, color=colors)
     ax.set_yticks(ys)
-    ax.set_yticklabels([f"{it.rank}. {it.label}" for it in items], fontsize=8)
+    ax.set_yticklabels(
+        [f"{it.rank}. {it.label} ({_format_effect(it.effect, it.unit)})" for it in items],
+        fontsize=8,
+    )
     ax.invert_yaxis()
-    unit = items[0].unit if items else ""
-    ax.set_xlabel(f"효과 ({unit})" if unit else "효과")
+
+    units = {it.unit for it in items}
+    if len(units) == 1:
+        unit_label = next(iter(units))
+        ax.set_xlabel(f"효과 크기 (절대값, {unit_label})" if unit_label else "효과 크기 (절대값)")
+    else:
+        ax.set_xlabel("효과 크기 (절대값, 단위는 각 라벨 참고)")
+
     _wrap_caption(fig, viz.title, viz.caption)
     fig.tight_layout(rect=(0, 0.04, 1, 0.9))
+    return fig
+
+
+def _render_ranked_bars(viz: RankedBarsViz, out_path: Path) -> None:
+    fig = _build_ranked_bars_fig(viz)
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
 
 
-def _render_table(viz: TableViz, out_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# table (QA-103: unit 표기 - KRW 천단위 콤마 + "원", % → "%", date → 그대로)
+# ---------------------------------------------------------------------------
+
+
+def _format_table_cell(value: Any, unit: str | None) -> str:
+    if unit == "KRW" and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:,.0f}원"
+    if unit == "%" and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:g}%"
+    return str(value)
+
+
+def _build_table_fig(viz: TableViz) -> plt.Figure:
     data = viz.data
     fig, ax = plt.subplots(figsize=(7, max(1.5, 0.4 * (len(data.rows) + 1))))
     ax.axis("off")
     col_labels = [c.label for c in data.columns]
-    cell_text = [[str(row.get(c.key, "")) for c in data.columns] for row in data.rows]
+    cell_text = [
+        [_format_table_cell(row.get(c.key, ""), c.unit) for c in data.columns]
+        for row in data.rows
+    ]
     table = ax.table(cellText=cell_text, colLabels=col_labels, loc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(8)
     _wrap_caption(fig, viz.title, viz.caption)
     fig.tight_layout(rect=(0, 0.04, 1, 0.9))
+    return fig
+
+
+def _render_table(viz: TableViz, out_path: Path) -> None:
+    fig = _build_table_fig(viz)
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
 
