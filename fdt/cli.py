@@ -11,19 +11,29 @@ from pathlib import Path
 
 import typer
 
-from fdt.engine.schemas.export import export_json_schemas
+from fdt.tools.schema_export import export_json_schemas
 
 app = typer.Typer(help="FDT 엔진 테스트용 CLI")
 
 
 @app.callback()
 def _main() -> None:
-    """FDT 엔진 테스트용 CLI. 서브커맨드는 아래를 본다."""
+    """FDT 엔진 테스트용 CLI. 서브커맨드는 아래를 본다.
+
+    콘솔 스크립트(`fdt`)와 `python -m fdt.cli` 양쪽에서 항상 실행되므로,
+    한글 출력이 깨지지 않도록 여기서 UTF-8 을 강제한다(SPEC §10).
+    """
+
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
 
 
 @app.command()
 def schema(
-    out: Path = typer.Option(
+    out: Path = typer.Option(  # noqa: B008
         Path("schemas"), "--out", help="JSON Schema 를 저장할 디렉터리"
     ),
 ) -> None:
@@ -36,8 +46,4 @@ def schema(
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    except (AttributeError, ValueError):
-        pass
     app()

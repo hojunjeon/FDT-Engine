@@ -15,14 +15,7 @@ from fdt.engine.errors import E_INPUT_DUP, E_INPUT_EMPTY, E_INPUT_REF, E_INPUT_T
 from fdt.engine.schemas.behavior import Behavior, EnvelopeBehavior, ShockModel
 from fdt.engine.schemas.input import TwinInput
 from fdt.engine.schemas.state import (
-    AccountState,
-    CardState,
-    Committed,
-    Cycle,
-    EnvelopeState,
     IncomeSchedule,
-    Indicators,
-    IssuedBilling,
     State,
 )
 from fdt.engine.taxonomy import ENVELOPE_IDS, ENVELOPES
@@ -162,6 +155,172 @@ def test_empty_violation_no_managed_account_or_card():
         TwinInput.model_validate(data)
 
     assert E_INPUT_EMPTY in _validation_error_message(exc_info)
+
+
+def test_empty_violation_no_managed_account_even_with_managed_card():
+    # 리뷰 N3: 관리 계좌 0개는 관리 카드 수와 합산하지 않고 그 자체로
+    # E-INPUT-EMPTY 다 (§5.3 PRIMARY 계좌 결정에 관리 계좌가 필요).
+    data = example_input_dict_copy()
+    for account in data["accounts"]:
+        account["is_managed"] = False
+    assert any(card["is_managed"] for card in data["cards"])
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_EMPTY in _validation_error_message(exc_info)
+
+
+# ---------------------------------------------------------------------------
+# B1: taxonomy 완전 대조 (봉투 id<->이름, 세분류 매핑, 22종)
+# ---------------------------------------------------------------------------
+
+
+def test_taxonomy_violation_envelope_ids_reversed():
+    # (가) 봉투 id 를 전부 역순(8-id)으로 뒤집으면, 이름 집합은 그대로라도
+    # id<->이름 매핑이 taxonomy.ENVELOPE_IDS 와 달라져 조회 시 조용히 다른
+    # 봉투를 가리킨다 (리뷰 B1). id 만 뒤집고 name 은 그대로 두면 EnvelopeDef
+    # id 유일성은 유지된다(1..7 재배치이므로).
+    data = example_input_dict_copy()
+    for envelope in data["envelopes"]:
+        envelope["id"] = 8 - envelope["id"]
+    # subcategories 도 새 envelope id 를 참조하도록 맞춰야 참조 오류가 아니라
+    # taxonomy 매핑 오류로 걸린다(그렇지 않으면 E_INPUT_REF 이전에 이미
+    # taxonomy 검사가 실패해도 무방하지만, 이 케이스는 envelopes 자체의
+    # id<->이름 불일치를 확인하는 것이 목적이다).
+    for sub in data["subcategories"]:
+        sub["envelope_id"] = 8 - sub["envelope_id"]
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_TAXONOMY in _validation_error_message(exc_info)
+
+
+def test_taxonomy_violation_subcategory_wrong_envelope_mapping():
+    # (나) subcategories[0].envelope_id 를 1(외식) -> 5(쇼핑) 처럼 실제
+    # taxonomy 매핑과 다르게 바꾸면, id 는 여전히 envelopes 안에 있어도
+    # taxonomy.SUBCATEGORIES 와 (id, envelope_id, name) 집합이 달라진다.
+    data = example_input_dict_copy()
+    first_sub = data["subcategories"][0]
+    assert first_sub["id"] == 1
+    assert first_sub["envelope_id"] == ENVELOPE_IDS["외식"]
+    first_sub["envelope_id"] = ENVELOPE_IDS["쇼핑"]
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_TAXONOMY in _validation_error_message(exc_info)
+
+
+def test_taxonomy_violation_only_21_subcategories():
+    # (다) 세분류를 21종으로 줄이면(1종 누락) 개수·집합 대조에서 실패한다.
+    data = example_input_dict_copy()
+    assert len(data["subcategories"]) == 22
+    data["subcategories"].pop()
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_TAXONOMY in _validation_error_message(exc_info)
+
+
+# ---------------------------------------------------------------------------
+# N2: transactions 외 배열의 id 중복 검사 (같은 id, 다른 내용 -> E-INPUT-DUP)
+# ---------------------------------------------------------------------------
+
+
+def test_dup_violation_accounts_same_id_different_content():
+    data = example_input_dict_copy()
+    dup = copy.deepcopy(data["accounts"][0])
+    dup["balance"] = dup["balance"] + 1
+    data["accounts"].append(dup)
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_DUP in _validation_error_message(exc_info)
+
+
+def test_dup_violation_cards_same_id_different_content():
+    data = example_input_dict_copy()
+    dup = copy.deepcopy(data["cards"][0])
+    dup["withdrawal_weekday"] = (dup["withdrawal_weekday"] + 1) % 7
+    data["cards"].append(dup)
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_DUP in _validation_error_message(exc_info)
+
+
+def test_dup_violation_card_billings_same_id_different_content():
+    data = example_input_dict_copy()
+    dup = copy.deepcopy(data["card_billings"][0])
+    dup["total_amount"] = dup["total_amount"] + 1
+    data["card_billings"].append(dup)
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_DUP in _validation_error_message(exc_info)
+
+
+def test_dup_violation_fixed_expenses_same_id_different_content():
+    data = example_input_dict_copy()
+    dup = copy.deepcopy(data["fixed_expenses"][0])
+    dup["amount"] = dup["amount"] + 1
+    data["fixed_expenses"].append(dup)
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_DUP in _validation_error_message(exc_info)
+
+
+def test_dup_violation_loans_same_id_different_content():
+    data = example_input_dict_copy()
+    dup = copy.deepcopy(data["loans"][0])
+    dup["balance"] = dup["balance"] + 1
+    data["loans"].append(dup)
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_DUP in _validation_error_message(exc_info)
+
+
+def test_dup_violation_envelopes_same_id_different_content():
+    # taxonomy 검사보다 dedup 이 먼저 실행되므로(순서 주의), 틀린 이름의
+    # 중복을 먼저 두고 올바른 항목을 뒤에 두면 최종 이름 매핑은 taxonomy 와
+    # 맞지만(따라서 taxonomy 오류로 새지 않고) dedup 단계에서 내용이 다른
+    # 같은 id 중복으로 걸린다.
+    data = example_input_dict_copy()
+    correct = next(e for e in data["envelopes"] if e["id"] == ENVELOPE_IDS["외식"])
+    wrong_dup = copy.deepcopy(correct)
+    wrong_dup["name"] = "존재하지않는이름"
+    data["envelopes"].insert(0, wrong_dup)
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_DUP in _validation_error_message(exc_info)
+
+
+def test_dup_violation_subcategories_same_id_different_content():
+    # envelopes 케이스와 동일한 이유로, 최종 집합이 taxonomy 와 일치하도록
+    # 틀린 중복을 앞에 두고 올바른 항목을 뒤에 둔다.
+    data = example_input_dict_copy()
+    correct = data["subcategories"][0]
+    assert correct["id"] == 1
+    wrong_dup = copy.deepcopy(correct)
+    wrong_dup["name"] = "존재하지않는세분류"
+    data["subcategories"].insert(0, wrong_dup)
+
+    with pytest.raises(ValidationError) as exc_info:
+        TwinInput.model_validate(data)
+
+    assert E_INPUT_DUP in _validation_error_message(exc_info)
 
 
 def test_future_transaction_does_not_fail_validation():

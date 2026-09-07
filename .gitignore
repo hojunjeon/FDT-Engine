@@ -12,5 +12,5 @@ htmlcov/
 data/engines/
 data/out/
 data/eval/
-schemas/
+/schemas/
 .venv-w0*/

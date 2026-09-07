@@ -12,9 +12,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from fdt.engine.schemas.export import export_json_schemas
 from fdt.engine.schemas.request import (
     BudgetChangeInjection,
+    FixedChangeInjection,
     GoalParams,
     ModeRequest,
     OptimizeParams,
@@ -24,29 +24,44 @@ from fdt.engine.schemas.request import (
 )
 from fdt.engine.schemas.result import (
     AccelerationAlert,
+    AppliedAction,
     ColumnSpec,
     ConcerningTxAlert,
+    DeltaBarsData,
+    DeltaBarsViz,
+    DeltaItem,
     EngineError,
     EngineMeta,
     EngineResult,
+    EventPoint,
+    EventTimelineData,
+    EventTimelineViz,
+    ForecastResult,
     GaugeData,
     GaugeEncoding,
     GaugeViz,
     Health,
     PaymentRisk,
+    RankedAction,
     RiskResult,
     TableData,
     TableViz,
 )
 from fdt.engine.taxonomy import Mode
-
+from fdt.tools.schema_export import export_json_schemas
 
 # ---------------------------------------------------------------------------
 # 공용 헬퍼
 # ---------------------------------------------------------------------------
 
 
-def _meta(mode: Mode, seed: int = 42, n_paths: int = 200, horizon_days: int = 30, elapsed_ms: int = 812) -> EngineMeta:
+def _meta(
+    mode: Mode,
+    seed: int = 42,
+    n_paths: int = 200,
+    horizon_days: int = 30,
+    elapsed_ms: int = 812,
+) -> EngineMeta:
     return EngineMeta(
         engine_id="a3f9c1d2e4b5",
         as_of=date(2026, 9, 7),
@@ -70,7 +85,10 @@ def _dates(n: int) -> list[date]:
 
 
 def test_forecast_request_roundtrip():
-    req = ModeRequest(mode=Mode.FORECAST, params={"include_envelopes": True, "include_events": True})
+    req = ModeRequest(
+        mode=Mode.FORECAST,
+        params={"include_envelopes": True, "include_events": True},
+    )
     dumped = req.model_dump(mode="json")
     again = ModeRequest.model_validate(dumped)
     assert again == req
@@ -155,8 +173,10 @@ def test_optimize_reach_goal_requires_goal():
 # ---------------------------------------------------------------------------
 
 
-def test_mode_params_mismatch_is_req_missing():
-    with pytest.raises(ValueError, match="E-REQ-MISSING"):
+def test_mode_params_mismatch_is_rejected():
+    # B2: mode 로 params 클래스를 먼저 확정해 파싱하므로, WHATIF 모양의 params 를
+    # FORECAST 에 보내면 ForecastParams 자체의 검증(미지 필드 금지)으로 즉시 실패한다.
+    with pytest.raises(ValidationError):
         ModeRequest(
             mode=Mode.FORECAST,
             params={
@@ -171,6 +191,21 @@ def test_mode_params_mismatch_is_req_missing():
                 ]
             },
         )
+
+
+def test_risk_empty_params_dict_parses_as_risk_params():
+    # B2 위반 1 회귀: {"mode":"RISK","params":{}} 는 유효한 요청이다
+    # (recent_tx_ids 는 선택 필드, 비면 as_of 당일 SPEND 전부 - SPEC 8.5).
+    req = ModeRequest(mode=Mode.RISK, params={})
+    assert isinstance(req.params, RiskParams)
+    assert req.params.recent_tx_ids == []
+
+
+def test_whatif_empty_params_dict_is_req_missing_injections():
+    # B2 위반 2 회귀: {"mode":"WHATIF","params":{}} 는 injections 누락으로
+    # E-REQ-MISSING 이어야 한다(엉뚱한 타입 메시지가 아니라).
+    with pytest.raises(ValueError, match="E-REQ-MISSING"):
+        ModeRequest(mode=Mode.WHATIF, params={})
 
 
 def test_horizon_out_of_range_is_req_range():
@@ -223,6 +258,18 @@ def test_budget_change_amount_over_limit_is_req_range():
         BudgetChangeInjection(envelope_id=1, new_budget=2_000_000_000_000)
 
 
+def test_fixed_change_missing_from_is_req_missing():
+    # B3: `from`(적용 시작일)이 빠지면 기본값(None)으로 조용히 통과하지 않고
+    # E-REQ-MISSING 이어야 한다 (SPEC 8.3 표 `FIXED_CHANGE.from`).
+    with pytest.raises(ValueError, match="E-REQ-MISSING"):
+        FixedChangeInjection(fixed_expense_id=40, new_amount=500000)
+
+
+def test_fixed_change_with_from_succeeds():
+    inj = FixedChangeInjection(fixed_expense_id=40, new_amount=500000, **{"from": "2026-10-01"})
+    assert inj.from_ == date(2026, 10, 1)
+
+
 # ---------------------------------------------------------------------------
 # 3. SPEC 15.C viz 예시
 # ---------------------------------------------------------------------------
@@ -269,6 +316,51 @@ def test_viz_table_example_from_spec_15c():
     assert viz.data.rows[0]["amount"] == 175000
 
 
+def test_event_timeline_encoding_color_is_fail_prob():
+    # B4: SPEC 9.3 표는 event_timeline encoding 필드명을 `color` 로 못박는다.
+    viz = EventTimelineViz(
+        id="events",
+        title="결제·수입 이벤트",
+        priority=1,
+        data=EventTimelineData(
+            events=[
+                EventPoint(
+                    date=date(2026, 9, 9),
+                    kind="CARD_BILL",
+                    name="KB 체크",
+                    amount=183500,
+                    fail_prob=0.02,
+                )
+            ]
+        ),
+    )
+    assert viz.encoding.color == "fail_prob"
+
+
+def test_delta_bars_encoding_with_hex_color_value_fails():
+    # B4: 키 검사가 아니라 값 검사. 렌더러 종속 색상 코드는 어느 키에 있든 거부한다.
+    with pytest.raises(ValidationError):
+        DeltaBarsViz(
+            id="d",
+            title="t",
+            priority=1,
+            data=DeltaBarsData(items=[DeltaItem(name="a", base=1, branch=2, delta=1, unit="KRW")]),
+            encoding={"stroke": "#ff0000"},
+        )
+
+
+def test_viz_caption_mentioning_library_name_fails():
+    with pytest.raises(ValidationError):
+        GaugeViz(
+            id="risk",
+            title="t",
+            priority=1,
+            data=GaugeData(value=1, level="SAFE"),
+            encoding=GaugeEncoding(unit="점"),
+            caption="matplotlib 으로 렌더",
+        )
+
+
 def test_viz_encoding_with_color_key_fails():
     with pytest.raises(ValidationError):
         GaugeViz(
@@ -280,7 +372,8 @@ def test_viz_encoding_with_color_key_fails():
         )
 
 
-def test_viz_table_row_with_color_key_fails():
+def test_viz_table_row_with_hex_color_value_fails():
+    # B4: 키 이름이 아니라 값(hex 색상 코드)이 렌더러 종속이라 거부된다.
     with pytest.raises(ValidationError):
         TableViz(
             id="t",
@@ -288,9 +381,35 @@ def test_viz_table_row_with_color_key_fails():
             priority=1,
             data=TableData(
                 columns=[ColumnSpec(key="a", label="a")],
-                rows=[{"a": 1, "color": "red"}],
+                rows=[{"a": 1, "stroke": "#ff0000"}],
             ),
         )
+
+
+def test_ranked_action_wraps_injection_with_cut_ratio():
+    # S9: RankedAction.actions 의 원소는 list[dict] 가 아니라
+    # AppliedAction(injection: Injection, cut_ratio?, label?) 이다.
+    action = RankedAction(
+        rank=1,
+        actions=[
+            AppliedAction(
+                injection={
+                    "type": "BUDGET_CHANGE",
+                    "envelope_id": 5,
+                    "new_budget": 280000,
+                },
+                cut_ratio=0.3,
+            )
+        ],
+        effect={"shortfall_prob": 0.12, "delta": -0.19, "end_balance_median": 1010000},
+        feasibility_note="이번 달 이미 사용 21만원, 남은 한도 7만원",
+    )
+    assert isinstance(action.actions[0].injection, BudgetChangeInjection)
+    assert action.actions[0].cut_ratio == 0.3
+
+    dumped = action.model_dump(mode="json")
+    again = RankedAction.model_validate(dumped)
+    assert again == action
 
 
 # ---------------------------------------------------------------------------
@@ -336,12 +455,41 @@ def _risk_result() -> RiskResult:
     )
 
 
+def _forecast_result() -> ForecastResult:
+    dates = _dates(2)
+    return ForecastResult(
+        trajectory={
+            "dates": dates,
+            "median": [1.0, 2.0],
+            "p10": [0.0, 1.0],
+            "p90": [2.0, 3.0],
+            "mean": [1.0, 2.0],
+        },
+        economic={"median": [1.0, 2.0], "p10": [0.0, 1.0], "p90": [2.0, 3.0]},
+        min_point={"date": dates[0], "median_balance": 118000},
+        end_point={"date": dates[1], "median_balance": 2013000},
+        shortfall_prob=0.09,
+        card_shortfall_prob=0.04,
+    )
+
+
 def test_engine_result_ok_requires_result():
     with pytest.raises(ValidationError):
         EngineResult(
             meta=_meta(Mode.RISK),
             request=_risk_request(),
             result=None,
+            status="OK",
+        )
+
+
+def test_engine_result_mode_result_type_mismatch_is_rejected():
+    # N4: meta.mode=RISK 인데 result 가 ForecastResult 인 조합은 거부돼야 한다.
+    with pytest.raises(ValidationError):
+        EngineResult(
+            meta=_meta(Mode.RISK),
+            request=_risk_request(),
+            result=_forecast_result(),
             status="OK",
         )
 

@@ -17,9 +17,11 @@ python -m venv .venv
 ## 실행 흐름 (예정)
 
 아래 CLI 서브커맨드는 각 담당 작업(W1, W5 등)에서 순차로 구현된다. 현재
-단계(W0)에서는 골격·taxonomy·errors·아키텍처 테스트만 갖춰져 있다.
+단계(W0)에서는 골격·taxonomy·errors·아키텍처 테스트, 그리고 `fdt schema`
+서브커맨드가 갖춰져 있다.
 
 ```
+fdt schema   --out schemas/                                                               # 구현됨 (W0)
 fdt gen      --profile A_steady --seed 7 --months 6 --out data/seed/A_seed7/   # 예정
 fdt build    --input data/seed/A_seed7/twin_input.json --out data/engines/A.engine.json  # 예정
 fdt run      --engine data/engines/A.engine.json --mode RISK --horizon 30 --seed 42       # 예정

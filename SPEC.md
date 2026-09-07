@@ -1,6 +1,6 @@
-# FDT 엔진 명세 (SPEC) v0.1
+# FDT 엔진 명세 (SPEC) v0.2
 
-- 상태: 초안 (2026-09-07). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
+- 상태: v0.2 (2026-09-07, W0 리뷰 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
 - 범위: **엔진만**. 자연어 라우팅(에이전트), 코칭 문장 생성, 대시보드, 이체 실행은 전부 범위 밖이다.
 - 상위 문서: `../../00_특화PJT_기획/07_FINAL/01_KeyFin_기획의도.md`, `02_KeyFin_요구사항명세.md`, `FDT.md`, ERD `ERD_v1.1`(erdcloud RvbfSXjYXdjM8RdjK), 금융망 API 문서 `docs/금융_api/`.
 - 선행 구현: `../03_Finance-Digital-Twin` 의 트윈 코어 공식(설계서 §7)을 계승한다. 계승·변경 내역은 §13에 적는다.
@@ -88,7 +88,8 @@ TwinInput(JSON) ──build_engine()──▶ Engine ──run(ModeRequest)─�
   "schema_version": "twin-input/1",
   "as_of": "2026-09-07",                      // 필수. 이 날짜까지의 데이터만 본다
   "user": {                                    // users + user_profiles
-    "id": 1, "employment_status": "EMPLOYED", "income_band": null, "birth_date": null
+    "id": 1, "employment_status?": "EMPLOYED", "income_band?": null, "birth_date?": null
+    // employment_status/income_band/birth_date 는 선택(?). 엔진 계산에 쓰이지 않음(어댑터 호환용)
   },
   "envelopes":     [{"id":1,"name":"외식"}, ...],                     // 7종 고정
   "subcategories": [{"id":1,"envelope_id":1,"name":"음식점"}, ...],   // 22종
@@ -105,7 +106,7 @@ TwinInput(JSON) ──build_engine()──▶ Engine ──run(ModeRequest)─�
   }],
   "card_billings": [{
     "id": 30, "card_id": 20, "billing_date": "2026-09-01", "total_amount": 183500,
-    "status": "UNPAID", "paid_at": null
+    "status": "UNPAID", "paid_at": null                // status 값 집합: UNPAID | PAID
   }],
   "fixed_expenses": [{
     "id": 40, "name": "월세", "expense_type": "RENT",   // RENT|SUBSCRIPTION|CARD_BILL|LOAN|UTILITY|INSURANCE|TELECOM
@@ -118,7 +119,7 @@ TwinInput(JSON) ──build_engine()──▶ Engine ──run(ModeRequest)─�
     "withdrawal_account_id": 10, "repayment": "INTEREST_ONLY"   // INTEREST_ONLY | AMORTIZING(원리금균등)
   }],
   "budgets": [{                                       // budgets + budget_envelopes (선택. 없으면 엔진이 제안)
-    "budget_month": "202609", "status": "CONFIRMED",
+    "budget_month": "202609", "status": "CONFIRMED",   // status 값 집합: PROPOSED | CONFIRMED
     "envelopes": [{"envelope_id":1,"proposed_amount":350000,"confirmed_amount":300000}, ...]
   }],
   "transactions": [{
@@ -147,11 +148,11 @@ TwinInput(JSON) ──build_engine()──▶ Engine ──run(ModeRequest)─�
 | 검사 | 실패 시 |
 | --- | --- |
 | `as_of` 이후 날짜의 거래 존재 | 경고 `W-INPUT-FUTURE_TX` 후 **무시**(홀드아웃 평가를 위해 허용) |
-| 봉투 7종·세분류→봉투 매핑 누락 | 오류 `E-INPUT-TAXONOMY` |
+| 봉투 7종·세분류→봉투 매핑 누락, 또는 봉투 id↔이름·세분류 22종·세분류→봉투 매핑이 `taxonomy` 와 완전히 일치하지 않음 | 오류 `E-INPUT-TAXONOMY` |
 | 카드의 `withdrawal_account_id` 가 accounts 에 없음 | 오류 `E-INPUT-REF` |
-| 거래 id 중복(다른 내용) | 오류 `E-INPUT-DUP` |
+| 모든 배열의 id 중복(다른 내용). 같은 id·같은 내용은 1건으로 정리 | 오류 `E-INPUT-DUP` |
 | 계좌 대사: `opening_balance + Σ부호거래 ≠ balance` | 경고 `W-RECON` 와 차액. `strict=true` 면 오류 |
-| 관리 대상(`is_managed`) 계좌·카드 0개 | 오류 `E-INPUT-EMPTY` |
+| 관리 대상(`is_managed`) 계좌 0개 | 오류 `E-INPUT-EMPTY` |
 | 거래 이력 < 28일 | 경고 `W-INPUT-SHORT_HISTORY`, Behavior 는 기본값 비중 증가 |
 
 ---
@@ -178,11 +179,12 @@ Engine
 ### 4.2 불변 원칙 (MUST)
 
 1. `fdt/engine/**` 는 `openai`, `anthropic`, `ollama`, `requests`, `httpx` 를 import 하지 않는다. 테스트 `test_architecture.py` 가 검사한다.
-2. 난수는 `numpy.random.default_rng(seed)` 만. `random`, `hash()`, `time` 기반 시드 금지.
+2. 난수 시드에 `time`/`hash()`/`random` 사용 금지. 시드는 `numpy.random.default_rng(seed)` 에만 넣는다. 성능 계측용 `time.perf_counter()` 만 허용(예: `EngineMeta.elapsed_ms` 측정).
 3. 금액 연산은 정수. 확률·비율·로그정규 파라미터만 float.
 4. `ledger` 는 생성 후 변경 불가(`tuple` 또는 frozen dataclass).
 5. 다섯 모드는 모두 `simulate()` 하나를 호출한다. 모드별로 별도 전이 규칙을 두지 않는다.
 6. 출력 JSON 에 차트 라이브러리·색상 코드·픽셀 값이 들어가지 않는다.
+7. 엔진 코어(`fdt/engine/**`)는 파일·콘솔 I/O 를 하지 않는다. 스키마 내보내기 등 도구는 `fdt/tools/` 에 둔다.
 
 ---
 
@@ -194,6 +196,7 @@ Engine
 {
   "as_of": "2026-09-07",
   "accounts": [{"id":10,"role":"PRIMARY","balance":1830000}, {"id":11,"role":"EMERGENCY","balance":350000}],
+                                    // role: PRIMARY | EMERGENCY | OTHER(비관리 계좌. is_managed=false 인 계좌가 여기 담긴다)
   "liquidity": 1830000,            // PRIMARY 잔액
   "emergency_fund": 350000,        // EMERGENCY 합. 시뮬레이션이 자동 사용하지 않는다
   "cards": [{
@@ -202,6 +205,8 @@ Engine
   }],
   "committed": [{                  // 약정 큐, as_of+1 ~ as_of+horizon_cap(90)
     "kind":"RENT","name":"월세","due":"2026-09-25","amount":700000,"certainty":1.0,"account_id":10,"card_id":null
+    // kind 허용 집합: RENT | UTILITY | INSURANCE | TELECOM | SUBSCRIPTION | LOAN | CARD_BILL
+    // 수입은 큐에 넣지 않는다(§8.2 events 로만 표현)
   }],
   "envelopes": [{
     "envelope_id":1,"name":"외식","budget":300000,"spent":212400,"remaining":87600,"budget_source":"CONFIRMED"   // CONFIRMED|PROPOSED|ENGINE
@@ -262,7 +267,7 @@ Engine
 
 ## 6. Behavior (행동 모델)
 
-윈도우 `[as_of − 89, as_of]`(90일, 최소 28일). `SPEND` 만 사용, 같은 날·같은 카드·같은 금액의 승인+취소 쌍은 제거.
+윈도우 `[as_of − 89, as_of]`(90일, 최소 28일). `SPEND` 만 사용, 같은 날·같은 카드·같은 금액의 승인+취소 쌍은 제거. 이력이 28일 미만이면 `window_days` 는 실제 이력 일수를 담고 `W-INPUT-SHORT_HISTORY` 경고를 낸다.
 
 | 파라미터 | 추정 | 클립·기본값 |
 | --- | --- | --- |
@@ -343,7 +348,7 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 ```
 
 - 모드 선택은 **요청자가 명시**한다. 엔진은 추론하지 않는다. 테스트 시 CLI `--mode` 로 지정한다(§10).
-- 필수 파라미터 누락은 `E-REQ-MISSING`, 범위 밖은 `E-REQ-RANGE`. 0 이나 기본값으로 조용히 바꾸지 않는다.
+- 필수 파라미터 누락은 `E-REQ-MISSING`, 범위 밖은 `E-REQ-RANGE`. 0 이나 기본값으로 조용히 바꾸지 않는다. 검증 실패 시 코드 문자열을 포함한 오류를 낸다(파싱 규약은 §9.1 참조).
 - 금액 파라미터는 0 ~ 1,000,000,000,000 정수 원.
 
 ### 8.2 FORECAST (미래 상태 예측)
@@ -353,10 +358,10 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 `result`:
 ```jsonc
 {
-  "trajectory": {"dates":[...], "median":[...], "p10":[...], "p90":[...], "mean":[...]},
+  "trajectory": {"dates":[...], "median":[...], "p10":[...], "p90":[...], "mean":[...]},  // mean 필수. trajectory 배열만 float, 그 외 금액은 정수 원(반올림)
   "economic":   {"median":[...], "p10":[...], "p90":[...]},
-  "min_point":  {"date":"2026-09-24","median_balance":118000,"p10_balance":-64000},
-  "end_point":  {"date":"2026-10-07","median_balance":2013000},
+  "min_point":  {"date":"2026-09-24","median_balance":118000,"p10_balance":-64000},        // 정수 원(반올림)
+  "end_point":  {"date":"2026-10-07","median_balance":2013000},                            // 정수 원(반올림)
   "envelopes":  [{"envelope_id":1,"name":"외식","budget":300000,"spent_now":212400,
                   "projected_month_end_median":338000,"exhaust_date_median":"2026-09-21","overrun_prob":0.71}],
   "events":     [{"date":"2026-09-09","kind":"CARD_BILL","name":"KB 체크","amount":183500,"fail_prob":0.02},
@@ -373,8 +378,8 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 | --- | --- | --- |
 | `SPEND` | `on`(날짜 또는 `days_from_now`), `amount`, `envelope_id`, `method`(CARD/CASH) | 단건 지출 |
 | `INCOME` | `on`, `amount` | 단건 수입 |
-| `RECURRING_SPEND` | `start`, `every_days` 또는 `day_of_month`, `amount`, `envelope_id`, `method`, `until?` | 구독 추가 등 |
-| `FIXED_CHANGE` | `fixed_expense_id`, `new_amount` 또는 `cancel: true`, `from` | 고정비 변경·해지 |
+| `RECURRING_SPEND` | `start`, `every_days` 또는 `day_of_month`, `amount`, `envelope_id`, `method`, `until?`(선택, 종료일) | 구독 추가 등 |
+| `FIXED_CHANGE` | `fixed_expense_id`, `new_amount` 또는 `cancel: true`, `from`(필수, 적용 시작일) | 고정비 변경·해지 |
 | `BUDGET_CHANGE` | `envelope_id`, `new_budget`, `behavior_follows`(bool, 기본 true) | 예산 변경. true 면 elasticity_gate 기준이 함께 바뀜 |
 | `EXTERNAL` | `price_index_mult?`, `loan_rate_delta_bp?`, `income_growth_pct?` | 외부 변수 시나리오 |
 | `EMERGENCY_DRAW` | `on`, `amount` | 비상금 → PRIMARY 이체 |
@@ -382,7 +387,7 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 `result`:
 ```jsonc
 {
-  "base":   { FORECAST.result 축약: trajectory.median/p10/p90, min_point, end_point, shortfall_prob, card_shortfall_prob },
+  "base":   { FORECAST.result 축약: trajectory.median/p10/p90, min_point, end_point, shortfall_prob, card_shortfall_prob },  // 최저·말일 잔액은 정수 원(반올림)
   "branch": { 동일 },
   "delta":  {"min_balance": -150000, "end_balance": -150000, "shortfall_prob": +0.11, "card_shortfall_prob": +0.06,
              "first_shortfall_date": {"base":null,"branch":"2026-09-24"},
@@ -400,7 +405,7 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 ```jsonc
 { "goal_type": "BALANCE",                 // BALANCE(목표일 잔액 ≥ target) | SAVE(기간 누적 저축 ≥ target) | ENVELOPE_ADHERE(이번 달 전 봉투 예산 내)
   "target_amount": 2000000, "target_date": "2026-12-31",    // ENVELOPE_ADHERE 는 둘 다 생략
-  "protect_essential": true }             // 필수 봉투(교통비·의료건강·편의점마트잡화) 하한 80% 보장
+  "protect_essential": true }             // 필수 봉투({교통비, 의료·건강, 편의점·마트·잡화}) 하한 80% 보장
 ```
 
 `result`:
@@ -427,8 +432,8 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 {
   "risk_score": 37, "level": "WARNING",            // score = round(100 × max(card_shortfall_prob, 0.6 × shortfall_prob)), <20 SAFE, <50 WARNING
   "shortfall_prob": 0.31, "card_shortfall_prob": 0.37,
-  "worst_day": "2026-09-16", "expected_shortfall": 142000,        // 부족 경로 최저 경제 잔액 절대값 평균
-  "payment_risks": [{"due":"2026-09-09","kind":"CARD_BILL","name":"KB 체크","amount":183500,"fail_prob":0.02,"median_balance_before":1640000},
+  "worst_day": "2026-09-16", "expected_shortfall": 142000,        // 부족 경로 최저 경제 잔액 절대값 평균. 정수 원(반올림)
+  "payment_risks": [{"due":"2026-09-09","kind":"CARD_BILL","name":"KB 체크","amount":183500,"fail_prob":0.02,"median_balance_before":1640000},   // median_balance_before 는 정수 원(반올림)
                     {"due":"2026-09-16","kind":"CARD_BILL","name":"KB 체크","amount":175000,"fail_prob":0.35,"median_balance_before":161000},
                     {"due":"2026-09-25","kind":"RENT","name":"월세","amount":700000,"fail_prob":0.30,"median_balance_before":690000}],
   "alerts": [{"kind":"ACCELERATION","severity":"WARNING","ratio":1.42},
@@ -450,24 +455,32 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 ```jsonc
 { "objective": "MIN_SHORTFALL_PROB",     // MIN_SHORTFALL_PROB | MAX_END_BALANCE | REACH_GOAL(goal 파라미터 동반)
   "candidates": "AUTO",                  // AUTO 이면 §8.6.1 기본 후보 생성, 또는 injections 형식의 후보 배열
-  "max_actions": 3,                      // 조합 시 최대 행동 수
+  "max_actions": 3,                      // 조합 시 최대 행동 수. 1..3 (상한 3, 시뮬 예산 ≤ 40 근거)
   "constraints": {"protect_essential": true, "max_cut_ratio": 0.5, "allow_emergency_draw": false} }
 ```
 
 8.6.1 AUTO 후보 (각각 하나의 `override` 또는 `injection`):
-- 유연 봉투(외식·쇼핑·취미여가·기타) 각각 −10%, −20%, −30% (`BUDGET_CHANGE`, behavior_follows)
+- 유연 봉투(`{외식, 쇼핑, 취미·여가, 기타}`) 각각 −10%, −20%, −30% (`BUDGET_CHANGE`, behavior_follows)
 - 활성 SUBSCRIPTION 고정비 각각 해지 (`FIXED_CHANGE cancel`)
 - 비상금 이체 (허용 시, 부족액만큼 `EMERGENCY_DRAW`)
 - 카드 출금 요일 변경(수입일 직후 요일) (`override.card_withdrawal_weekday`)
 
 8.6.2 탐색: 단일 행동 전부 CRN 평가 → 목적함수 개선 상위 `k=6` 를 골라 2~`max_actions` 조합 그리디(한 봉투에 두 비율 동시 금지). 총 시뮬 횟수 ≤ 40 을 넘으면 후보를 잘라낸다.
 
+`ranked[].actions[]` 의 원소 타입 `AppliedAction`:
+```
+AppliedAction = { injection: Injection, cut_ratio?: float, label?: str }
+```
+`injection` 은 §8.3 Injection 유니온(7종) 그대로다. `cut_ratio`/`label` 은 어떤 Injection 타입에도 없는 부가 정보이므로 `AppliedAction` 래퍼에서만 붙인다(Injection 유니온 자체는 `extra="forbid"` 를 유지한다).
+
 `result`:
 ```jsonc
 {
   "objective": "MIN_SHORTFALL_PROB",
   "baseline": {"shortfall_prob":0.31,"card_shortfall_prob":0.37,"end_balance_median":780000},
-  "ranked": [{"rank":1,"actions":[{"type":"BUDGET_CHANGE","envelope_id":5,"new_budget":280000,"cut_ratio":0.3}],
+  "ranked": [{"rank":1,
+              "actions":[{"injection":{"type":"BUDGET_CHANGE","envelope_id":5,"new_budget":280000,"behavior_follows":true},
+                          "cut_ratio":0.3,"label":"쇼핑 예산 30% 축소"}],
               "effect":{"shortfall_prob":0.12,"delta":-0.19,"end_balance_median":1010000,"cost_of_action":"쇼핑 월 12만원 감소"},
               "feasibility_note":"이번 달 이미 사용 21만원, 남은 한도 7만원"},
              ...],
@@ -494,6 +507,8 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
   "status": "OK"                          // OK | ERROR. ERROR 면 result 없음, error{code,message}
 }
 ```
+
+`EngineError.code` 는 pydantic `ValidationError` 메시지를 파싱해서 채우지 않는다. 검증 지점에서 `FdtError(code=...)` 로 감싸 전달한 값을 그대로 옮긴다. pydantic 오류 메시지에는 코드 문자열이 포함되지만 메시지가 그 코드로 **시작함을 보장하지 않으므로**(필드명·위치가 앞에 붙는다) `startswith` 등으로 코드를 추출해서는 안 된다.
 
 ### 9.2 facts (발화용 사실)
 
@@ -551,6 +566,7 @@ fdt run   --engine ... --mode GOAL   --params-file req/goal_dec.json
 fdt inspect --engine ...            # State/Behavior 요약 표 출력
 fdt render  --result out/A_risk.json --out out/A_risk/    # viz 명세 → PNG (개발용, matplotlib)
 fdt validate --result out/A_risk.json                      # 스키마 + facts/viz 정합 검사
+fdt schema  --out schemas/                                  # TwinInput/State/Behavior/ModeRequest/EngineResult JSON Schema 내보내기
 ```
 
 - 모드 선택은 `--mode` 필수. 라우팅 기능은 없다.
@@ -659,3 +675,30 @@ fdt validate --result out/A_risk.json                      # 스키마 + facts/v
   "annotations":[{"type":"point","x":"2026-09-16","label":"가장 위험한 결제일"}],
   "caption":"9월 16일 카드대금 17만 5천원의 부족 확률이 35%로 가장 높다."}]
 ```
+
+---
+
+## 16. 개정 이력
+
+`docs/reviews/20260907_W0.md` W0 리뷰의 "SPEC 수정 제안" 반영 내역 (v0.1 → v0.2).
+
+| # | 요약 |
+| --- | --- |
+| S1 | §3.2 `user.employment_status`/`income_band`/`birth_date` 를 선택(`?`)으로 표기하고 "엔진 계산에 쓰이지 않음(어댑터 호환용)" 명시 |
+| S2 | §3.2 `card_billings.status` 값 집합 `UNPAID \| PAID`, `budgets.status` 값 집합 `PROPOSED \| CONFIRMED` 명시 |
+| S3 | §3.3 `E-INPUT-EMPTY` 를 "관리 대상 계좌 0개" 로 명확화 |
+| S4 | §3.3 `E-INPUT-TAXONOMY` 에 봉투 id↔이름·세분류 22종·세분류→봉투 매핑이 taxonomy 와 완전 일치해야 함을 명시 |
+| S5 | §3.3 `E-INPUT-DUP` 를 거래 배열에서 모든 배열로 확대 |
+| S6 | §5.1/§5.4 `committed.kind` 허용 집합을 열거하고 "수입은 큐에 넣지 않는다(§8.2 events 로만)" 명시 |
+| S7 | §6 에 이력 28일 미만일 때 `window_days` 는 실제 이력 일수이고 `W-INPUT-SHORT_HISTORY` 경고를 낸다는 규약 추가 |
+| S8 | §8.3 `FIXED_CHANGE.from` 을 필수(적용 시작일)로 명시하고 `RECURRING_SPEND.until?` 과 표기를 구분 |
+| S9 | §8.6 `ranked[].actions[]` 원소 타입을 `AppliedAction = {injection: Injection, cut_ratio?: float, label?: str}` 로 정의하고 예시 JSON 을 그 구조로 수정 |
+| S10 | §8.6 `max_actions` 상한을 `1..3` 으로 명시(시뮬 예산 ≤ 40 근거) |
+| S11 | §9.1 에 `EngineError.code` 는 `ValidationError` 메시지 파싱이 아니라 검증 지점의 `FdtError(code)` 로 채운다고 명시. §8.1 문장도 "코드 문자열을 포함한 오류" 로 수정 |
+| S12 | §4.2-2 를 "난수 시드에 `time`/`hash()`/`random` 사용 금지. 성능 계측용 `time.perf_counter()` 만 허용" 으로 구체화 |
+| S13 | §8.2 `trajectory.mean` 을 필수로 명시 |
+| S14 | §8.4/§8.6.1 필수·유연 봉투를 중괄호 집합 + 가운뎃점 포함 정식 이름으로 수정 |
+| S15 | §10 CLI 목록에 `fdt schema --out <dir>` 추가 |
+| 추가1 | §8.2 `min_point`/`end_point`, §8.5 `expected_shortfall`/`payment_risks[].median_balance_before`, §8.3 base/branch 요약의 최저·말일 잔액을 정수 원(반올림)으로 명시. `trajectory` 배열만 float 유지 |
+| 추가2 | §4.2 에 "엔진 코어(`fdt/engine/**`)는 파일·콘솔 I/O 를 하지 않는다. 도구는 `fdt/tools/`" 항목 추가 |
+| 추가3 | §5.1 `AccountState.role` 에 `OTHER`(비관리 계좌) 허용을 명시 |
