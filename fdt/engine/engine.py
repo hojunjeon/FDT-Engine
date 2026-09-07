@@ -449,7 +449,10 @@ def build_engine(
     warnings.extend(queue_warnings)
 
     budgets = {envelope.envelope_id: envelope.budget for envelope in state.envelopes}
-    behavior = estimate_behavior(ledger, effective_as_of, budgets=budgets)
+    # S49: 창 길이를 명시적으로 넘기지 않는다 - `estimate_behavior` 가
+    # "가용 이력 전체, 상한 180일" 을 스스로 계산한다(리뷰
+    # docs/reviews/20260907_W6_W10.md 항목 2-3, SPEC §14 R10).
+    behavior = estimate_behavior(ledger, effective_as_of, budgets=budgets, window_days=None)
 
     engine_id = _compute_engine_id(twin, effective_as_of, budgets_override)
 

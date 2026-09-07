@@ -203,7 +203,7 @@
 
 검토 포인트: viz 에 색상·픽셀·라이브러리명이 없는가. facts 의 확률 단위가 모드 내 통일인가(M1).
 
-### Phase 7. 평가와 QA 마감 (D15 ~ D18) [진행 중]
+### Phase 7. 평가와 QA 마감 (D15 ~ D18) [평가 도구 완료, 기준 미달 항목 원인 분석 진행 중]
 
 산출물
 - `eval/backtest.py`(sMAPE, 최저점 오차, 커버리지), `eval/calibration.py`(ECE, Brier, 구간 표본), `eval/monotonic.py`, `eval/report.py`(마크다운 표).
@@ -233,9 +233,9 @@
 | W10 OPTIMIZE | `modes/optimize.py`, 테스트 | W8, W9 | 2일 | 완료 |
 | W11 facts·viz | `facts.py`, `viz.py`, `test_facts.py`, `test_viz.py` | W7~W10 결과 스키마 확정 시점부터, 모드별 점진 | 2일 | 완료 |
 | W12 validate·render | `tools/*`, `test_validate_render.py` | W11 | 1.5일 | 완료 |
-| W13 속성·골든·통합 | `tests/property`, `tests/golden`, `tests/integration` | W7~W12 | 1.5일 | 진행 중(골든 제외) |
-| W14 평가 | `eval/*` | W7 (backtest·calibration), W8 (monotonic) | 2일 | 진행 중 |
-| W15 QA·문서 | `docs/QA_REPORT.md`, `README.md`, `docs/reviews/` | 전부 | 1.5일 | 미착수 |
+| W13 속성·골든·통합 | `tests/property`, `tests/golden`, `tests/integration` | W7~W12 | 1.5일 | 골든 제외 완료 |
+| W14 평가 | `eval/*` | W7 (backtest·calibration), W8 (monotonic) | 2일 | 완료 |
+| W15 QA·문서 | `docs/QA_REPORT.md`, `README.md`, `docs/reviews/` | 전부 | 1.5일 | 진행 중(QA·README L2) |
 
 병렬 규칙
 - 함수 시그니처는 SPEC 이 계약이다. 시그니처를 바꾸려면 SPEC 수정 커밋을 먼저 낸다.
@@ -438,6 +438,7 @@ QA 마감 전, SPEC §3.3, §8.1~8.6, §9.4, §12 의 표를 한 줄씩 체크�
 | P5 | facts 표기 규칙이 에이전트 팀 요구와 다름 | 통합 시 문장 충실도 실패 | Phase 0 에 JSON Schema 와 예시를 공유하고 M1 을 D5 전에 합의 |
 | P6 | 03 저장소 코드 이식 시 스키마 혼선 | 금융망 필드명이 엔진 코어에 남음 | 이식은 공식·테스트 케이스만, 코드는 `TwinInput` 기준으로 재작성. 어댑터에만 금융망 필드 허용 |
 | P7 | Windows 한글 인코딩 | 콘솔 깨짐, 테스트 실패 | 모든 파일 I/O `encoding="utf-8"`, CLI 진입점에서 stdout 재설정 |
+| P8 | Behavior 표본 분산이 커버리지·C sMAPE 를 좌우함 | 백테스트 커버리지 전 프로필 시드별 이탈, C sMAPE 기준 초과 | S49 창 확대(가용 이력 전체, 상한 180일)·축소 추정(α=14, L1 결정 대기) |
 
 ---
 
@@ -457,5 +458,5 @@ QA 마감 전, SPEC §3.3, §8.1~8.6, §9.4, §12 의 표를 한 줄씩 체크�
 - [x] `schemas/*.schema.json` 내보내기 (W0 완료)
 - [ ] `data/seed/` 4 프로필, `tests/golden/` 20개: seed 4 프로필 완료, 골든 스냅샷 20개는 미완료(W13, 골든 제외)
 - [ ] `pytest -q` 통과, 커버리지 ≥ 85% (미확정, 골든 미완료로 W13 진행 중)
-- [ ] `docs/EVAL_REPORT.md`, `docs/QA_REPORT.md`, `docs/reviews/` 3회 전체 리뷰: 리뷰 문서 4건 기록됨(`20260907_W0`, `_W1_W2`, `_W3_W4_W5`, `_W6_W10`), `EVAL_REPORT.md`/`QA_REPORT.md` 는 미작성(W14~W15)
+- [x] `docs/EVAL_REPORT.md`, `docs/QA_REPORT.md`, `docs/reviews/` 3회 전체 리뷰: 리뷰 문서 4건 기록됨(`20260907_W0`, `_W1_W2`, `_W3_W4_W5`, `_W6_W10`), `EVAL_REPORT.md` 작성 완료(W14), `QA_REPORT.md` 는 미작성(W15)
 - [ ] `README.md`: 설치, `gen → build → run → validate → render` 5분 안내, 모드별 요청 예시 5개 (W15 미착수)

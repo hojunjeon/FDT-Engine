@@ -5,8 +5,16 @@
 
 공개 함수 (다른 작업 ID 가 import 하는 계약):
 
-- `estimate_behavior(ledger, as_of, *, budgets, window_days=90) -> Behavior`
+- `estimate_behavior(ledger, as_of, *, budgets, window_days=None) -> Behavior`
 - `detect_income_schedule(ledger, as_of) -> IncomeSchedule`
+
+S49(오케스트레이터 결정, 리뷰 `docs/reviews/20260907_W6_W10.md` 항목 2-3
+`R10`): 추정 창을 `[as_of-89, as_of]` 90일 고정에서 "가용 이력 전체(상한
+180일), 하한 28일(부족하면 있는 만큼)" 로 완화했다. `window_days=None`
+이면 `min(180, 실제 이력 일수)` 를 쓴다. 90일 창에서 봉투별 건수 추정이
+시드에 따라 ±26% 흩어져 30일 누적 소비가 0.74~1.10배로 갈리던 것이
+A·D 프로필 커버리지 이탈의 직접 원인이었다(표본 크기 ∝ 창 길이이므로
+창을 넓히면 표준오차가 준다).
 """
 
 from __future__ import annotations
@@ -30,7 +38,11 @@ __all__ = ["detect_income_schedule", "estimate_behavior"]
 # 상수 (SPEC §6 표)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_WINDOW_DAYS = 90
+# S49: 창은 더 이상 90일 고정이 아니다. `window_days=None` 이면
+# `min(_MAX_WINDOW_DAYS, 가용 이력 일수)` 를 쓴다(하한 28일은 `_resolve_window`
+# 가 이미 이력 부족 시 실제 이력 일수로 자동 클립하므로 별도 강제가 필요
+# 없다 - 요청값이 28 미만이어도 결과는 항상 "있는 만큼"이 된다).
+_MAX_WINDOW_DAYS = 180
 _WEEKDAY_ALPHA = 2.0
 
 _DEFAULT_AMOUNT_MU = math.log(10_000)
@@ -65,6 +77,9 @@ _ESSENTIAL_ELASTICITY_BOUNDS = (0.8, 1.2)
 _FLEXIBLE_ELASTICITY_BOUNDS = (0.5, 2.0)
 # N12/S35: 급여 창 겹침(수입 간격 < 12일 또는 불규칙) 임계.
 _PAYDAY_WINDOW_OVERLAP_GAP_DAYS = 12
+# S49 항목 2: daily_rate 축소 추정(shrinkage, alpha=14, pooled_rate 로
+# 당김)은 시도·측정했으나 채택하지 않는다 - D_goal_saver seed=1 커버리지가
+# 오히려 악화됐다(0.233 -> 0.067). 근거는 docs/EVAL_REPORT.md 변경 이력.
 
 _ENVELOPE_EXCLUDED_TAGS: frozenset[ExcludeTag] = frozenset(
     {ExcludeTag.EMERGENCY, ExcludeTag.CARRYOVER}
@@ -126,6 +141,23 @@ def _next_day_of_month(as_of: date, day_of_month: int) -> date:
 # ---------------------------------------------------------------------------
 # 원장 -> 윈도우 / 유효 소비 (SPEC §6 첫 문단)
 # ---------------------------------------------------------------------------
+
+
+def _default_window_request(ledger: tuple[LedgerTx, ...], as_of: date) -> int:
+    """S49: `window_days=None` 일 때의 요청 창 길이.
+
+    "가용 이력 전체, 상한 180일" - 가용 이력이 180일보다 길면 180일로
+    자르고, 짧으면 있는 만큼만 요청한다(하한 28일 강제는 불필요: 이력이
+    28일 미만이면 이 값도 28 미만이 되고, `_resolve_window` 가 어차피
+    `min(available)` 로 시작점을 클립해 결과 `n_days` 는 항상 실제
+    이력 일수와 같아진다).
+    """
+
+    available = [record.date for record in ledger if record.date <= as_of]
+    if not available:
+        return 1
+    history_days = (as_of - min(available)).days + 1
+    return min(_MAX_WINDOW_DAYS, history_days)
 
 
 def _resolve_window(
@@ -471,11 +503,20 @@ def estimate_behavior(
     as_of: date,
     *,
     budgets: dict[int, int],
-    window_days: int = _DEFAULT_WINDOW_DAYS,
+    window_days: int | None = None,
 ) -> Behavior:
-    """SPEC §6 전체 표를 따라 Behavior 를 추정한다. 원장만 읽는다."""
+    """SPEC §6 전체 표를 따라 Behavior 를 추정한다. 원장만 읽는다.
 
-    window_start, n_days = _resolve_window(ledger, as_of, window_days)
+    S49: `window_days=None`(기본값)이면 "가용 이력 전체, 상한 180일" 을
+    쓴다. 명시적으로 정수를 넘기면(예: 테스트에서 좁은 창을 재현할 때)
+    그 값을 그대로 요청한다 - 이력이 짧으면 여전히 실제 이력 일수로
+    클립된다.
+    """
+
+    requested_window = (
+        _default_window_request(ledger, as_of) if window_days is None else window_days
+    )
+    window_start, n_days = _resolve_window(ledger, as_of, requested_window)
     spends = _effective_spends(ledger, window_start, as_of)
     daily_spend = _daily_totals(spends)
 
@@ -535,6 +576,14 @@ def estimate_behavior(
         else:
             prelim_mu_by_env[envelope_id] = pooled_mu
 
+    # S49 항목 2 비교 측정 결과(docs/EVAL_REPORT.md 변경 이력 참조): 창
+    # 확대(180일)에 더해 daily_rate 축소 추정(alpha=14, pooled_rate 로
+    # 당김)까지 켜서 측정했더니 D_goal_saver seed=1 커버리지가 오히려
+    # 악화됐다(0.233 -> 0.067, B_card_crunch 도 커버리지 통과 시드 수가
+    # 줄었다) - 실측 결과 **채택하지 않는다**. 이 문제의 원인은 표본
+    # 부족(창을 넓히거나 pooled 로 당겨 고칠 수 있는 것)이 아니라 시드마다
+    # 다른 실제 생성 과정의 분산이므로, daily_rate 를 pooled 평균으로
+    # 당기면 표본이 두꺼운 프로필까지 편향만 더한다. 창 확대만 남긴다.
     envelope_behaviors: list[EnvelopeBehavior] = []
     amount_mu_by_env: dict[int, float] = {}
     for envelope_id in _ALL_ENVELOPE_IDS:
