@@ -53,7 +53,10 @@ E_INPUT_EMPTY = "E-INPUT-EMPTY"
 E_RECON = "E-RECON"
 E_REQ_MISSING = "E-REQ-MISSING"
 E_REQ_RANGE = "E-REQ-RANGE"
+E_REQ_INVALID = "E-REQ-INVALID"
 E_ENGINE_ID_MISMATCH = "E-ENGINE-ID-MISMATCH"
+E_ENGINE_LOAD = "E-ENGINE-LOAD"
+E_MODE_NOT_IMPLEMENTED = "E-MODE-NOT_IMPLEMENTED"
 
 # ---------------------------------------------------------------------------
 # 경고 코드 (SPEC 3.3, 5.4, 6장)
@@ -72,7 +75,10 @@ MESSAGES: dict[str, str] = {
     E_RECON: "계좌 대사 차액이 있다(strict 모드)",
     E_REQ_MISSING: "모드 요청에 필수 파라미터가 빠졌다",
     E_REQ_RANGE: "모드 요청 파라미터가 허용 범위를 벗어났다",
+    E_REQ_INVALID: "모드 요청 파라미터 검증에 실패했다",
     E_ENGINE_ID_MISMATCH: "저장된 engine_id 와 로드 시점 재계산 결과가 다르다",
+    E_ENGINE_LOAD: "엔진 파일을 불러오지 못했다",
+    E_MODE_NOT_IMPLEMENTED: "요청한 모드는 아직 구현되지 않았다",
     W_INPUT_FUTURE_TX: "as_of 이후 날짜의 거래가 있어 무시했다",
     W_RECON: "계좌 대사 차액이 있다",
     W_INPUT_SHORT_HISTORY: "거래 이력이 28일 미만이라 Behavior 기본값 비중을 높였다",

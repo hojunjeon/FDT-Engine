@@ -459,6 +459,7 @@ def _example_behavior_dict(weekday_mult=None) -> dict:
             for name in ENVELOPES
         ],
         "payday_boost": 1.3,
+        "pre_payday_damp": 1.0,
         "shock": {"daily_prob": 0.01, "mu": 11.5, "sigma": 0.6},
         "income": _example_income_schedule(),
     }

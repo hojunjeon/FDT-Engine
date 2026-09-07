@@ -1,5 +1,19 @@
 """숫자를 만드는 유일한 곳. 외부 I/O 및 LLM 의존성이 없다 (SPEC 4.2).
 
-이 파일은 하위 모듈이 준비되는 대로 공개 API(build_engine, ModeRequest 등)를
-재노출한다. 현재 단계(W0)에서는 taxonomy, errors 만 구현되어 있다.
+`build_engine`, `Engine`, `ModeRequest`, `EngineResult`, `TwinInput` 을
+공개 API 로 재노출한다(SPEC 4장, PLAN Phase 2 W5).
 """
+
+from fdt.engine.engine import Engine, EngineBuildMeta, build_engine
+from fdt.engine.schemas.input import TwinInput
+from fdt.engine.schemas.request import ModeRequest
+from fdt.engine.schemas.result import EngineResult
+
+__all__ = [
+    "Engine",
+    "EngineBuildMeta",
+    "EngineResult",
+    "ModeRequest",
+    "TwinInput",
+    "build_engine",
+]

@@ -65,5 +65,9 @@ class Behavior(_Base):
     window_days: int = Field(ge=1)
     envelopes: list[EnvelopeBehavior] = Field(min_length=7, max_length=7)
     payday_boost: float = Field(ge=0.7, le=2.0)
+    # SPEC v0.3 §6 표 추가 항목(W4/S 리뷰 반영): 다음 수입 5일 전 일평균 /
+    # 그 외(급여 후 7일과 급여 전 5일을 모두 제외한 날) 일평균. 표본
+    # 부족(10일 미만)이면 1.0.
+    pre_payday_damp: float = Field(ge=0.5, le=1.3)
     shock: ShockModel
     income: IncomeSchedule

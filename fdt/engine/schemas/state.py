@@ -54,6 +54,7 @@ class Committed(_Base):
         "UTILITY",
         "INSURANCE",
         "TELECOM",
+        "SELF_TRANSFER",
     ]
     name: str
     due: date
