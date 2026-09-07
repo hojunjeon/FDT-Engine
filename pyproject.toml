@@ -43,5 +43,5 @@ select = ["E", "F", "I", "UP", "B", "RUF"]
 ignore = []
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 ignore_missing_imports = true

@@ -3,8 +3,8 @@ description: 프리랜서 불규칙 입금(월 2~4회), 주말 소비 폭증, �
 accounts:
 - {id: 10, alias: 입출금통장, is_income: true, opening_balance: 30000, managed: true}
 cards:
-- {id: 20, alias: 체크카드, kind: DEBIT, withdrawal_weekday: 3, withdrawal_account_id: 10}
-income: {type: IRREGULAR, day_of_month: null, amount: 900000, jitter_sigma: 0.4, median_gap_days: 10}
+- {id: 20, alias: 체크카드, kind: CREDIT, withdrawal_weekday: 3, withdrawal_account_id: 10}
+income: {type: IRREGULAR, amount: 900000, day_of_month: null, jitter_sigma: 0.4, median_gap_days: 10}
 fixed_expenses:
 - {id: 40, name: 통신비, expense_type: TELECOM, amount: 45000, is_variable: false, payment_day: 5,
   withdrawal_account_id: 10, card_id: null}
@@ -55,12 +55,14 @@ spending:
     amount_mu: 10.35
     amount_sigma: 0.9
     card_share: 0.32
-    weekday_mult: [1, 1, 1, 1, 1, 1, 1]
+    weekday_mult: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 hidden:
   payday_boost: 1.4
   pre_payday_damp: 1.0
-  elasticity: 1.4
+  elasticity: {외식: 1.4, 교통비: 1.0, 의료·건강: 1.0, 취미·여가: 1.4, 쇼핑: 1.4, 편의점·마트·잡화: 1.0,
+    기타: 1.4}
   shock: {daily_prob: 0.05, mu: 11.6, sigma: 0.7}
   cancel_prob: 0.03
   dutch_pay_prob: 0.08
   emergency_transfer_monthly: 0
+  pending_ratio: 0.18

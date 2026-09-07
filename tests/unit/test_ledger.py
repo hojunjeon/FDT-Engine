@@ -218,7 +218,10 @@ def test_envelope_net_spend_excludes_emergency_and_carryover_includes_dutch():
                 tx_type="DEPOSIT",
                 tx_date="2026-09-10",
                 amount=1000,
-                account_id=11,  # is_income=False 계좌 -> REFUND
+                # is_income=True 계좌(10)로 넣어도 exclude_tag=DUTCH 면
+                # REFUND 여야 한다(B2). account_id=11(is_income=False) 는
+                # 버그를 가리므로 회귀 고정용으로는 10 을 쓴다.
+                account_id=10,
                 subcategory_id=FOOD_SUBCATEGORY_ID,
                 exclude_tag="DUTCH",
             ),
@@ -236,15 +239,71 @@ def test_envelope_net_spend_excludes_emergency_and_carryover_includes_dutch():
     assert net.get(WAESIK, 0) == 0
 
 
+def test_dutch_deposit_into_income_account_is_not_income():
+    # B2: exclude_tag == DUTCH 인 DEPOSIT 은 계좌의 is_income 과 무관하게
+    # 항상 REFUND(봉투 +) 다. is_income=True 계좌(10)에 들어와도 INCOME 이
+    # 되어서는 안 된다.
+    twin = _build_twin(
+        [
+            _tx(
+                9105,
+                tx_type="DEPOSIT",
+                tx_date="2026-09-10",
+                amount=22200,
+                account_id=10,  # is_income=True
+                subcategory_id=FOOD_SUBCATEGORY_ID,
+                exclude_tag="DUTCH",
+            ),
+        ]
+    )
+    led = ledger.normalize(twin)
+    assert len(led) == 1
+    record = led[0]
+    assert record.flow == Flow.REFUND
+    assert record.flow != Flow.INCOME
+    assert record.signed_amount == 22200
+    assert record.envelope_id == WAESIK
+
+
+def test_envelope_net_spend_can_be_negative_when_dutch_refund_exceeds_spend():
+    # N9: abs() 로 부호를 삼키면 안 된다. 같은 봉투에서 SPEND 10,000 +
+    # DUTCH REFUND 15,000 이면 순지출은 -5,000 이어야 한다(더치 정산 수령이
+    # 실제 지출을 초과).
+    twin = _build_twin(
+        [
+            _tx(
+                9106,
+                tx_type="WITHDRAW",
+                tx_date="2026-09-10",
+                amount=10000,
+                subcategory_id=FOOD_SUBCATEGORY_ID,
+            ),
+            _tx(
+                9107,
+                tx_type="DEPOSIT",
+                tx_date="2026-09-11",
+                amount=15000,
+                account_id=10,
+                subcategory_id=FOOD_SUBCATEGORY_ID,
+                exclude_tag="DUTCH",
+            ),
+        ]
+    )
+    led = ledger.normalize(twin)
+    net = ledger.envelope_net_spend(led, date(2026, 9, 1), date(2026, 9, 30))
+    assert net[WAESIK] == -5000
+
+
 # ---------------------------------------------------------------------------
-# 4. flow_hint 우선 (분류 순서 1~5 건너뜀)
+# 4. flow_hint 는 라벨만 덮어씀, 구조 변환(취소 분할/상대 레코드)은 항상 실행
+# (N7, S19)
 # ---------------------------------------------------------------------------
 
 
-def test_flow_hint_overrides_classification_order():
-    # counterparty_account_id 가 내 계좌라 원래는 TRANSFER_INTERNAL 로 판정될
-    # 거래지만, flow_hint=SPEND 가 있으면 그대로 SPEND 로 기록되고 상대 계좌
-    # 레코드도 추가되지 않는다.
+def test_flow_hint_overrides_only_label_not_structural_transform():
+    # counterparty_account_id 가 내 계좌면 flow_hint 값과 무관하게 상대 계좌
+    # 레코드가 항상 생성된다(구조 변환). flow_hint="SPEND" 는 두 레코드의
+    # flow 라벨만 SPEND 로 덮어쓸 뿐, 상대 레코드 생성 자체를 막지 않는다.
     twin = _build_twin(
         [
             _tx(
@@ -252,6 +311,7 @@ def test_flow_hint_overrides_classification_order():
                 tx_type="TRANSFER",
                 tx_date="2026-09-10",
                 amount=2000,
+                account_id=10,
                 subcategory_id=FOOD_SUBCATEGORY_ID,
                 counterparty_account_id=11,
                 flow_hint="SPEND",
@@ -259,11 +319,70 @@ def test_flow_hint_overrides_classification_order():
         ]
     )
     led = ledger.normalize(twin)
-    assert len(led) == 1
-    record = led[0]
-    assert record.flow == Flow.SPEND
-    assert record.signed_amount == -2000
-    assert record.envelope_id == WAESIK
+    assert len(led) == 2
+    by_id = {r.id: r for r in led}
+    assert set(by_id) == {9201, 92011}  # 9201*10+1
+
+    main = by_id[9201]
+    counter = by_id[92011]
+    assert main.flow == Flow.SPEND
+    assert counter.flow == Flow.SPEND
+    assert main.account_id == 10
+    assert main.signed_amount == -2000
+    assert counter.account_id == 11
+    assert counter.signed_amount == 2000
+    assert main.envelope_id == WAESIK
+
+
+def test_flow_hint_on_canceled_card_tx_still_splits_into_two_records():
+    # 카드형 고정비 취소(flow_hint="FIXED")도 flow_hint 이전에 취소 판정이
+    # 항상 먼저 적용돼 SPEND(-)/REFUND(+) 두 건으로 분할된다(N7 회귀).
+    twin = _build_twin(
+        [
+            _tx(
+                9202,
+                tx_type="CARD",
+                tx_date="2026-09-10",
+                amount=17000,
+                card_id=20,
+                status="CANCELED",
+                flow_hint="FIXED",
+            )
+        ]
+    )
+    led = ledger.normalize(twin)
+    assert len(led) == 2
+    by_id = {r.id: r for r in led}
+    assert set(by_id) == {9202, -9202}
+    assert by_id[9202].flow == Flow.FIXED
+    assert by_id[-9202].flow == Flow.FIXED
+    assert by_id[9202].signed_amount == -17000
+    assert by_id[-9202].signed_amount == 17000
+    assert by_id[9202].signed_amount + by_id[-9202].signed_amount == 0
+
+
+def test_flow_hint_transfer_internal_still_creates_counterparty_record():
+    twin = _build_twin(
+        [
+            _tx(
+                9203,
+                tx_type="TRANSFER",
+                tx_date="2026-09-10",
+                amount=300000,
+                account_id=10,
+                counterparty_account_id=11,
+                flow_hint="TRANSFER_INTERNAL",
+            )
+        ]
+    )
+    led = ledger.normalize(twin)
+    assert len(led) == 2
+    by_id = {r.id: r for r in led}
+    assert set(by_id) == {9203, 92031}
+    assert by_id[9203].flow == Flow.TRANSFER_INTERNAL
+    assert by_id[92031].flow == Flow.TRANSFER_INTERNAL
+    assert by_id[9203].signed_amount == -300000
+    assert by_id[92031].signed_amount == 300000
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +409,93 @@ def test_fixed_expense_payment_day_tolerance_boundary():
     flows = {r.origin_tx_id: r.flow for r in led}
     assert flows[9401] == Flow.FIXED
     assert flows[9402] == Flow.SPEND
+
+
+# ---------------------------------------------------------------------------
+# 5b. 고정비 오분류 가드 (B3, S17): subcategory_id 붙은 소비는 FIXED 아님.
+# 계좌 매칭은 WITHDRAW/TRANSFER 만, CARD 는 card_id 로만 매칭.
+# ---------------------------------------------------------------------------
+
+
+def test_card_spend_with_subcategory_same_amount_and_day_is_not_fixed():
+    # D_goal_saver 재현: 카드형 구독(넷플릭스, card_id=20, amount=17000,
+    # payment_day=3)과 같은 금액·같은 날짜의 카드 소비지만 subcategory_id 가
+    # 붙어 있으면(사람이 분류한 소비) FIXED 후보에서 제외돼야 한다.
+    subscription = {
+        "id": 42,
+        "name": "넷플릭스",
+        "expense_type": "SUBSCRIPTION",
+        "amount": 17000,
+        "is_variable": False,
+        "payment_day": 3,
+        "withdrawal_account_id": None,
+        "card_id": 20,
+        "active": True,
+    }
+    twin = _build_twin(
+        [
+            _tx(
+                9310,
+                tx_type="CARD",
+                tx_date="2026-09-03",
+                amount=17000,
+                card_id=20,
+                subcategory_id=CAFE_SUBCATEGORY_ID,
+            ),
+        ],
+        extra_fixed_expenses=[subscription],
+    )
+    led = ledger.normalize(twin)
+    assert len(led) == 1
+    record = led[0]
+    assert record.flow == Flow.SPEND
+    assert record.envelope_id == WAESIK
+
+
+def test_card_spend_without_subcategory_still_matches_fixed_by_card_id():
+    # 같은 구독 고정비, subcategory_id 없는 정상 케이스는 그대로 FIXED 로
+    # 매칭돼야 한다(가드가 정상 매칭까지 막지 않는지 확인).
+    subscription = {
+        "id": 42,
+        "name": "넷플릭스",
+        "expense_type": "SUBSCRIPTION",
+        "amount": 17000,
+        "is_variable": False,
+        "payment_day": 3,
+        "withdrawal_account_id": None,
+        "card_id": 20,
+        "active": True,
+    }
+    twin = _build_twin(
+        [
+            _tx(9311, tx_type="CARD", tx_date="2026-09-03", amount=17000, card_id=20),
+        ],
+        extra_fixed_expenses=[subscription],
+    )
+    led = ledger.normalize(twin)
+    assert len(led) == 1
+    assert led[0].flow == Flow.FIXED
+
+
+def test_card_tx_does_not_match_account_type_fixed_expense():
+    # 계좌형 고정비(RENT, withdrawal_account_id=10)는 CARD 거래와 매칭돼서는
+    # 안 된다(B3 원인 1) - 생성기가 CARD 거래에도 account_id 를 카드 출금
+    # 계좌로 채우기 때문에, 계좌만 보면 평범한 카드 소비가 고정비로 잡힌다.
+    twin = _build_twin(
+        [
+            _tx(
+                9312,
+                tx_type="CARD",
+                tx_date="2026-09-25",
+                amount=700000,
+                account_id=10,
+                card_id=20,
+            ),
+        ]
+    )
+    led = ledger.normalize(twin)
+    assert len(led) == 1
+    assert led[0].flow == Flow.SPEND
 
 
 # ---------------------------------------------------------------------------

@@ -60,6 +60,11 @@ def gen(
     out: Path = typer.Option(  # noqa: B008
         Path("data/seed"), "--out", help="출력 루트 디렉터리"
     ),
+    omit_opening_balance: bool = typer.Option(
+        False,
+        "--omit-opening-balance",
+        help="accounts[].opening_balance 를 null 로 내보낸다(역산 경로 검증용, 리뷰 N12)",
+    ),
 ) -> None:
     """프로필 YAML + 시드 -> TwinInput + ground_truth (SPEC 11장).
 
@@ -71,7 +76,14 @@ def gen(
     end_date = date.fromisoformat(end)
     names = list(PROFILE_NAMES) if profile == "all" else [profile]
     for name in names:
-        out_dir = write_profile(name, out, seed=seed, months=months, end=end_date)
+        out_dir = write_profile(
+            name,
+            out,
+            seed=seed,
+            months=months,
+            end=end_date,
+            omit_opening_balance=omit_opening_balance,
+        )
         typer.echo(f"generated {name} (seed={seed}) -> {out_dir}")
 
 

@@ -15,7 +15,7 @@ accounts:
 cards:
   - id: 20
     alias: 체크카드
-    kind: DEBIT
+    kind: CREDIT
     withdrawal_weekday: 3
     withdrawal_account_id: 10
 
@@ -96,7 +96,16 @@ spending:
 hidden:
   payday_boost: 1.4
   pre_payday_damp: 1.0
-  elasticity: 1.4
+  # 봉투별 탄력도 (리뷰 N4, SPEC S24). 유연 봉투는 대표값(1.4) 부근, 필수
+  # 봉투는 1.0 에 가깝게 둔다.
+  elasticity:
+    외식: 1.4
+    교통비: 1.0
+    의료·건강: 1.0
+    취미·여가: 1.4
+    쇼핑: 1.4
+    편의점·마트·잡화: 1.0
+    기타: 1.4
   shock:
     daily_prob: 0.05
     mu: 11.6
@@ -104,3 +113,4 @@ hidden:
   cancel_prob: 0.03
   dutch_pay_prob: 0.08
   emergency_transfer_monthly: 0
+  pending_ratio: 0.18

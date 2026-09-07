@@ -13,26 +13,29 @@
                 계좌형은 잔액 부족 시 당일 그대로 거절(재시도 없음).
     3 청구 발행 월요일에 직전 월~일 카드 사용분(취소 제외)을 합산해
                 `card_billings` 를 UNPAID 로 발행.
-    4 카드 출금 카드별 withdrawal_weekday 또는 미결제 청구서가 있는 날마다
-                오래된 청구서부터 시도. 부족하면 `card_shortfalls` 기록,
-                청구서는 유지되어 다음 날 다시 시도된다.
+    4 카드 출금 청구서별 예정 출금일(`_first_due`: billing_date 이후 당일 포함
+                첫 withdrawal_weekday) 이 지난 청구서만, 오래된 것부터 시도.
+                부족하면 `card_shortfalls` 기록 후 그 카드의 그날 남은
+                청구서는 시도하지 않는다(SPEC S16, 리뷰 B1).
     5 소비      봉투별 daily_rate x weekday_mult x payday_boost/
-                pre_payday_damp x elasticity(잔여 예산 <20%) 로 포아송 강도를
-                구하고, 발생 건수만큼 로그정규 금액을 뽑는다. card_share
-                비율만큼 카드 결제, 나머지는 체크성 출금(잔액 부족 시 거절 +
-                `declined_debits` 기록).
+                pre_payday_damp x elasticity(잔여 예산 <20%, 봉투별) 로
+                포아송 강도를 구하고, 발생 건수만큼 로그정규 금액을 뽑는다.
+                card_share 비율만큼 카드 결제, 나머지는 체크성 출금(잔액
+                부족 시 거절 + `declined_debits`(kind=SPEND) 기록).
     6 돌발      hidden.shock 파라미터로 하루 1건 이하의 대형 지출을 봉투
                 "기타" 에 발생시킨다. 카드/체크 비율은 전 봉투 card_share
                 평균을 쓴다.
     7 취소·더치 오늘 만든 카드 결제 일부를 취소(같은 레코드의 status 만
                 CANCELED 로 바꾼다, 새 레코드를 만들지 않는다)하고, 외식
-                고액 결제 일부에 더치페이 입금을 더한다.
-    8 기록      계좌별 그날의 잔액을 ground_truth.daily_balance 에 남긴다.
+                고액 결제 일부에 더치페이 입금을 더한다(수령분은 그 봉투의
+                순지출에서 차감, 리뷰 B2).
+    8 기록      계좌별 그날의 잔액을 ground_truth.daily_balance 에, 누적
+                unpaid_obligation/suppressed_demand 를 남긴다(리뷰 N8).
 
 엔진(`fdt/engine/**`)이 절대 읽지 않는 값: `spending`/`hidden` 전체
 (payday_boost, pre_payday_damp, elasticity, shock 분포, cancel_prob,
-dutch_pay_prob, 잔액 부족 시 체크 거절 여부)와 `ground_truth.json` 전체
-(SPEC 11장).
+dutch_pay_prob, pending_ratio, 잔액 부족 시 체크 거절 여부)와
+`ground_truth.json` 전체(SPEC 11장).
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ import yaml
 
 from fdt.engine.schemas.input import TwinInput
 from fdt.engine.taxonomy import ENVELOPE_IDS, ENVELOPES, OTHER_ENVELOPE_ID, SUBCATEGORIES
+from fdt.gen.profile_schema import validate_profile
 
 PROFILE_DIR = Path(__file__).parent / "profiles"
 DEFAULT_END = date(2026, 9, 7)
@@ -116,6 +120,23 @@ def _round100(v: float) -> int:
 def _day_or_last(d: date, day: int) -> bool:
     last = (d.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
     return d.day == min(day, last.day)
+
+
+def _first_due(billing_date: date, withdrawal_weekday: int) -> date:
+    """청구서의 예정 출금일 (SPEC S16 / 리뷰 B1 수정 지시).
+
+    `billing_date` 이후(당일 포함) 첫 `d.weekday() == withdrawal_weekday` 인
+    날을 반환하는 순수 함수. `withdrawal_weekday` 가 월요일(0)이고 청구서가
+    월요일에 발행되면 발행 당일이 곧 예정 출금일이다(경계는
+    `test_generator.py` 의 단위 테스트로 고정).
+    """
+
+    d = billing_date
+    for _ in range(7):
+        if d.weekday() == withdrawal_weekday:
+            return d
+        d += timedelta(days=1)
+    return d  # pragma: no cover - withdrawal_weekday 는 0..6 이라 도달 불가
 
 
 @dataclass
@@ -195,7 +216,7 @@ class Generator:
         self.cards: dict[int, _CardState] = {
             c["id"]: _CardState(
                 id=c["id"],
-                alias=c.get("alias", f"카드{c['id']}"),
+                alias=c["alias"] or f"카드{c['id']}",
                 kind=c["kind"],
                 withdrawal_weekday=c["withdrawal_weekday"],
                 withdrawal_account_id=c["withdrawal_account_id"],
@@ -217,10 +238,16 @@ class Generator:
         self._avg_card_share = float(
             np.mean([cfg["card_share"] for cfg in profile["spending"].values()])
         )
+        self._elasticity: dict[int, float] = self._build_elasticity_table(
+            profile["hidden"]["elasticity"]
+        )
 
         self._next_income: date | None = None
         self._last_income: date | None = None
         self._init_income_schedule()
+
+        self._unpaid_obligation_total = 0
+        self._suppressed_demand_total = 0
 
         self.gt: dict[str, Any] = {
             "daily_balance": {},
@@ -231,12 +258,29 @@ class Generator:
             "dutch_pays": [],
             "envelope_true_spend": {},
             "income_events": [],
+            "unpaid_obligation": {},
+            "suppressed_demand": {},
             "hidden_params": {
                 "spending": profile["spending"],
                 "hidden": profile["hidden"],
                 "income": profile["income"],
             },
         }
+
+    @staticmethod
+    def _build_elasticity_table(raw: float | dict[str, float]) -> dict[int, float]:
+        """`hidden.elasticity` 를 봉투별 dict 로 확장한다 (SPEC S24 / 리뷰 N4).
+
+        스칼라면 전 봉투에 같은 값을 준다. dict 면 봉투 이름 키를 id 로 바꾸고,
+        빠진 봉투는 1.0(탄력도 중립)으로 채운다.
+        """
+
+        if isinstance(raw, dict):
+            table = {ENVELOPE_IDS[name]: float(v) for name, v in raw.items()}
+            for eid in ENVELOPE_IDS.values():
+                table.setdefault(eid, 1.0)
+            return table
+        return {eid: float(raw) for eid in ENVELOPE_IDS.values()}
 
     # -- 수입 일정 ------------------------------------------------------
 
@@ -258,8 +302,21 @@ class Generator:
 
     # -- 거래 기록 헬퍼 ---------------------------------------------------
 
-    def _confirm_status(self) -> str:
-        return "AUTO" if self.rng.random() < 0.9 else "PENDING"
+    def _confirm_status(self, flow_hint: str | None, exclude_tag: str) -> str:
+        """거래 흐름별 확정 상태 (SPEC S20 / 리뷰 N5).
+
+        수입·고정비·카드대금·자기이체는 사용자가 다시 세분류를 확인할
+        필요가 없는 자동 인식 거래이므로 `CONFIRMED`. 더치페이 입금은
+        `AUTO`. 소비(그 외, `flow_hint is None`)만 프로필별
+        `hidden.pending_ratio` 확률로 `PENDING`, 나머지는 `AUTO` 다.
+        """
+
+        if flow_hint in ("INCOME", "FIXED", "CARD_BILL") or exclude_tag == "SELF_TRANSFER":
+            return "CONFIRMED"
+        if exclude_tag == "DUTCH":
+            return "AUTO"
+        pending_ratio = float(self.profile["hidden"]["pending_ratio"])
+        return "PENDING" if self.rng.random() < pending_ratio else "AUTO"
 
     def _time(self, lo: int = 8, hi: int = 22) -> time:
         h = int(self.rng.integers(lo, hi))
@@ -292,7 +349,7 @@ class Generator:
             "tx_date": tx_date,
             "tx_time": self._time(),
             "subcategory_id": subcategory_id,
-            "confirm_status": self._confirm_status(),
+            "confirm_status": self._confirm_status(flow_hint, exclude_tag),
             "exclude_tag": exclude_tag,
             "status": status,
             "flow_hint": flow_hint,
@@ -305,6 +362,24 @@ class Generator:
         ym = f"{d.year:04d}{d.month:02d}"
         month_bucket = self.gt["envelope_true_spend"].setdefault(ym, {})
         month_bucket[str(envelope_id)] = month_bucket.get(str(envelope_id), 0) + amount
+
+    def _record_declined(
+        self, d: date, *, kind: str, amount: int, envelope_id: int | None = None
+    ) -> None:
+        """잔액 부족으로 거절된 이체/결제 (SPEC S26 / 리뷰 N8).
+
+        `kind` 는 `FIXED`(계좌형 고정비 거절, 재시도 없음, `unpaid_obligation`
+        누적) | `LOAN`(대출이자 거절, 같은 방식으로 누적) |
+        `SPEND`(체크성 소비 거절, `suppressed_demand` 누적) 중 하나다.
+        """
+
+        self.gt["declined_debits"].append(
+            {"date": d.isoformat(), "kind": kind, "envelope_id": envelope_id, "amount": amount}
+        )
+        if kind == "SPEND":
+            self._suppressed_demand_total += amount
+        else:
+            self._unpaid_obligation_total += amount
 
     # -- 하루 처리 순서 (SPEC 7.2) ----------------------------------------
 
@@ -353,7 +428,7 @@ class Generator:
         self.gt["income_events"].append({"date": d.isoformat(), "amount": amount})
         self._last_income = d
 
-        emergency_amt = int(self.profile["hidden"].get("emergency_transfer_monthly", 0) or 0)
+        emergency_amt = int(self.profile["hidden"]["emergency_transfer_monthly"])
         if emergency_amt > 0 and self._emergency_id is not None:
             emer = self.accounts[self._emergency_id]
             acc.balance -= emergency_amt
@@ -373,7 +448,7 @@ class Generator:
             if not _day_or_last(d, fx["payment_day"]):
                 continue
             amount = int(fx["amount"])
-            if fx.get("card_id") is not None:
+            if fx["card_id"] is not None:
                 self._add_tx(
                     tx_type="CARD",
                     tx_date=d,
@@ -396,9 +471,7 @@ class Generator:
                         flow_hint="FIXED",
                     )
                 else:
-                    self.gt["declined_debits"].append(
-                        {"date": d.isoformat(), "envelope_id": None, "amount": amount}
-                    )
+                    self._record_declined(d, kind="FIXED", amount=amount)
 
         for loan in self.profile["loans"]:
             if not _day_or_last(d, loan["interest_day"]):
@@ -418,9 +491,7 @@ class Generator:
                     flow_hint="FIXED",
                 )
             else:
-                self.gt["declined_debits"].append(
-                    {"date": d.isoformat(), "envelope_id": None, "amount": interest}
-                )
+                self._record_declined(d, kind="LOAN", amount=interest)
 
     def _week_card_total(self, card_id: int, start: date, end: date) -> int:
         s, e = start.isoformat(), end.isoformat()
@@ -458,15 +529,16 @@ class Generator:
                 (b for b in card.billings if b.status == "UNPAID" and b.billing_date <= d),
                 key=lambda b: b.billing_date,
             )
-            if not unpaid:
-                continue
-            due_today = d.weekday() == card.withdrawal_weekday
-            overdue = any(b.billing_date < d for b in unpaid)
-            if not due_today and not overdue:
-                # 발행일 당일이고 출금 요일도 아니면 아직 시도하지 않는다
+            # 예정 출금일(첫 withdrawal_weekday) 이 지난 청구서만 시도한다.
+            # SPEC S16 / 리뷰 B1: "발행일이 지났는가" 가 아니라 "예정 출금일이
+            # 지났는가" 로 판정해야 withdrawal_weekday 가 지켜진다.
+            attemptable = [
+                b for b in unpaid if _first_due(b.billing_date, card.withdrawal_weekday) <= d
+            ]
+            if not attemptable:
                 continue
             acc = self.accounts[card.withdrawal_account_id]
-            for billing in unpaid:
+            for billing in attemptable:
                 if acc.balance >= billing.total_amount:
                     acc.balance -= billing.total_amount
                     billing.status = "PAID"
@@ -490,9 +562,18 @@ class Generator:
         if budget <= 0:
             return 1.0
         remaining_ratio = 1 - self._month_spent[envelope_id] / budget
-        return float(self.profile["hidden"]["elasticity"]) if remaining_ratio < 0.2 else 1.0
+        return self._elasticity[envelope_id] if remaining_ratio < 0.2 else 1.0
 
     def _cycle_mult(self, d: date) -> float:
+        """SPEC §7.2 5단계 `boost` 복합 계수 (리뷰 N3, SPEC S23 제안).
+
+        `boost(d) = payday_boost^[수입 후 7일] * pre_payday_damp^[다음 수입
+        5일 전]`. 두 조건은 겹치지 않는다(수입 후 7일 구간과 다음 수입 5일
+        전 구간은 최소 급여 주기 10일 이상에서 서로 배타적). `pre_payday_damp`
+        는 생성기가 여전히 `hidden` 에 숨기는 값이고(SPEC §11), 엔진은
+        `payday_boost` 만 원장에서 추정한다(§6).
+        """
+
         hidden = self.profile["hidden"]
         m = 1.0
         if self._last_income is not None and 0 <= (d - self._last_income).days < 7:
@@ -573,9 +654,7 @@ class Generator:
             self._month_spent[envelope_id] += amount
             self._record_envelope_spend(d, envelope_id, amount)
         else:
-            self.gt["declined_debits"].append(
-                {"date": d.isoformat(), "envelope_id": envelope_id, "amount": amount}
-            )
+            self._record_declined(d, kind="SPEND", amount=amount, envelope_id=envelope_id)
 
     def _step_shock(self, d: date) -> None:
         sh = self.profile["hidden"]["shock"]
@@ -640,6 +719,12 @@ class Generator:
                     exclude_tag="DUTCH",
                 )
                 self.gt["dutch_pays"].append({"date": today, "amount": share})
+                # 리뷰 B2(생성기 측): 더치 수령분은 그 봉투의 순지출에서
+                # 빠져야 한다(원장은 §5.2 규칙 4 에 따라 DUTCH 입금을 그
+                # 봉투의 REFUND 로 반영하므로 정답도 같은 정의를 따른다).
+                envelope_id = self._envelope_of(tx["subcategory_id"])
+                self._month_spent[envelope_id] -= share
+                self._record_envelope_spend(d, envelope_id, -share)
 
     @staticmethod
     def _envelope_of(subcategory_id: int | None) -> int:
@@ -651,13 +736,17 @@ class Generator:
         return OTHER_ENVELOPE_ID
 
     def _step_record(self, d: date) -> None:
-        self.gt["daily_balance"][d.isoformat()] = {
+        key = d.isoformat()
+        self.gt["daily_balance"][key] = {
             str(acc.id): acc.balance for acc in self.accounts.values()
         }
+        # SPEC S26 / 리뷰 N8: 경제 잔액(§7.2 8단계) 검증용 일별 누적 스냅샷.
+        self.gt["unpaid_obligation"][key] = self._unpaid_obligation_total
+        self.gt["suppressed_demand"][key] = self._suppressed_demand_total
 
     # -- 출력 -------------------------------------------------------------
 
-    def build_twin_input(self) -> dict[str, Any]:
+    def build_twin_input(self, *, omit_opening_balance: bool = False) -> dict[str, Any]:
         accounts_out = []
         for a in self.profile["accounts"]:
             acc = self.accounts[a["id"]]
@@ -670,7 +759,7 @@ class Generator:
                     "is_managed": a["managed"],
                     "is_income": a["is_income"],
                     "balance": acc.balance,
-                    "opening_balance": a["opening_balance"],
+                    "opening_balance": None if omit_opening_balance else a["opening_balance"],
                 }
             )
 
@@ -678,7 +767,7 @@ class Generator:
             {
                 "id": c["id"],
                 "issuer_code": f"{1000 + c['id']}",
-                "card_name": c.get("alias", f"카드{c['id']}"),
+                "card_name": c["alias"] or f"카드{c['id']}",
                 "kind": c["kind"],
                 "withdrawal_account_id": c["withdrawal_account_id"],
                 "withdrawal_weekday": c["withdrawal_weekday"],
@@ -705,10 +794,10 @@ class Generator:
                 "name": fx["name"],
                 "expense_type": fx["expense_type"],
                 "amount": fx["amount"],
-                "is_variable": fx.get("is_variable", False),
+                "is_variable": fx["is_variable"],
                 "payment_day": fx["payment_day"],
-                "withdrawal_account_id": fx.get("withdrawal_account_id"),
-                "card_id": fx.get("card_id"),
+                "withdrawal_account_id": fx["withdrawal_account_id"],
+                "card_id": fx["card_id"],
                 "active": True,
             }
             for fx in self.profile["fixed_expenses"]
@@ -787,11 +876,18 @@ class Generator:
 
 
 def load_profile(name_or_path: str) -> dict[str, Any]:
+    """프로필 YAML 을 읽고 `Profile` pydantic 모델로 검증한다 (리뷰 N10).
+
+    반환값은 `model_dump(mode="json")` 을 거친 dict 라서, 원본 YAML 이 생략한
+    선택 필드도 `profile_schema.Profile` 이 정의한 기본값으로 채워져 있다.
+    """
+
     p = Path(name_or_path)
     if not p.exists():
         p = PROFILE_DIR / f"{name_or_path}.yaml"
     with open(p, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw = yaml.safe_load(f)
+    return validate_profile(raw)
 
 
 def list_profiles() -> list[str]:
@@ -804,16 +900,20 @@ def generate(
     seed: int,
     months: int = DEFAULT_MONTHS,
     end: date = DEFAULT_END,
+    omit_opening_balance: bool = False,
 ) -> tuple[TwinInput, dict[str, Any], dict[str, Any]]:
     """프로필 이름 + 시드 -> (TwinInput, twin_input dict, ground_truth dict).
 
     반환하는 `TwinInput` 은 `model_validate` 를 이미 통과한 것이다.
+    `omit_opening_balance=True` 면 `accounts[].opening_balance` 를 전부
+    `null` 로 내보내 SPEC §3.2 의 역산 경로(`balance` - Σ거래)를 실데이터로
+    검증할 수 있게 한다 (리뷰 N12).
     """
 
     profile = load_profile(profile_name)
     gen = Generator(profile, seed=seed, months=months, end=end)
     gen.run()
-    twin_input_dict = gen.build_twin_input()
+    twin_input_dict = gen.build_twin_input(omit_opening_balance=omit_opening_balance)
     twin_input = TwinInput.model_validate(twin_input_dict)
     return twin_input, twin_input_dict, gen.gt
 
@@ -825,6 +925,7 @@ def write_profile(
     seed: int,
     months: int = DEFAULT_MONTHS,
     end: date = DEFAULT_END,
+    omit_opening_balance: bool = False,
 ) -> Path:
     """`out_root/<profile>_<seed>/` 에 twin_input.json, ground_truth.json,
     profile.yaml 을 쓴다. 재현성: 같은 (profile, seed, months, end) 는
@@ -832,7 +933,11 @@ def write_profile(
     낸다."""
 
     twin_input, _twin_input_raw, ground_truth = generate(
-        profile_name, seed=seed, months=months, end=end
+        profile_name,
+        seed=seed,
+        months=months,
+        end=end,
+        omit_opening_balance=omit_opening_balance,
     )
     # twin_input.json 은 model_dump(mode="json") 으로 직렬화해 스키마가
     # 실제로 왕복 검증됨을 보장한다(빌더가 만든 raw dict 를 그대로 쓰지 않음).

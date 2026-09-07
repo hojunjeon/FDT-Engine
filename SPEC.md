@@ -1,6 +1,6 @@
-# FDT 엔진 명세 (SPEC) v0.2
+# FDT 엔진 명세 (SPEC) v0.3
 
-- 상태: v0.2 (2026-09-07, W0 리뷰 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
+- 상태: v0.3 (2026-09-07, W1/W2 리뷰 반영). 구현은 이 문서를 단일 기준으로 삼고, 변경은 이 문서를 먼저 고친다.
 - 범위: **엔진만**. 자연어 라우팅(에이전트), 코칭 문장 생성, 대시보드, 이체 실행은 전부 범위 밖이다.
 - 상위 문서: `../../00_특화PJT_기획/07_FINAL/01_KeyFin_기획의도.md`, `02_KeyFin_요구사항명세.md`, `FDT.md`, ERD `ERD_v1.1`(erdcloud RvbfSXjYXdjM8RdjK), 금융망 API 문서 `docs/금융_api/`.
 - 선행 구현: `../03_Finance-Digital-Twin` 의 트윈 코어 공식(설계서 §7)을 계승한다. 계승·변경 내역은 §13에 적는다.
@@ -100,6 +100,8 @@ TwinInput(JSON) ──build_engine()──▶ Engine ──run(ModeRequest)─�
     "opening_balance": null                    // 선택. 없으면 balance − Σ거래 로 역산
   }],
   "cards": [{
+    // kind 는 CREDIT | DEBIT 이나 표시용이다. cards[] 의 카드는 kind 와 무관하게 전부 주 단위 청구 주기를 따른다(금융망 카드 모델).
+    // 체크카드 즉시 출금 소비는 이 카드 청구 주기가 아니라 tx_type=WITHDRAW 계좌 거래로 표현한다
     "id": 20, "issuer_code": "1001", "card_name": "KB 체크", "kind": "CREDIT",   // CREDIT | DEBIT
     "withdrawal_account_id": 10, "withdrawal_weekday": 1,                    // 0=월 … 6=일 (금융망 1~7 은 어댑터가 변환)
     "is_managed": true
@@ -205,7 +207,7 @@ Engine
   }],
   "committed": [{                  // 약정 큐, as_of+1 ~ as_of+horizon_cap(90)
     "kind":"RENT","name":"월세","due":"2026-09-25","amount":700000,"certainty":1.0,"account_id":10,"card_id":null
-    // kind 허용 집합: RENT | UTILITY | INSURANCE | TELECOM | SUBSCRIPTION | LOAN | CARD_BILL
+    // kind 허용 집합: RENT | UTILITY | INSURANCE | TELECOM | SUBSCRIPTION | LOAN | CARD_BILL | SELF_TRANSFER
     // 수입은 큐에 넣지 않는다(§8.2 events 로만 표현)
   }],
   "envelopes": [{
@@ -219,13 +221,13 @@ Engine
 
 ### 5.2 원장 정규화와 흐름 판정 (`engine/ledger.py`)
 
-`transactions[]` → `LedgerTx(id, date, time, account_id, card_id, signed_amount, flow, envelope_id, subcategory_id, confidence, source)`.
+`transactions[]` → `LedgerTx(id, date, time, account_id, card_id, signed_amount, flow, envelope_id, subcategory_id, confidence, source, counterparty_account_id)`. `tx_type == CARD` 인 거래의 `LedgerTx.account_id` 는 `None` 이다(카드 승인은 계좌 잔액에 영향이 없고 `CARD_BILL` 출금에서만 반영된다. §3.3 계좌 대사의 전제).
 
-흐름 판정 순서(`flow_hint` 가 있으면 그대로):
+흐름 판정 순서. `flow_hint` 는 판정 결과의 **흐름 라벨만** 덮어쓴다. 구조 변환(규칙 1 의 취소 2건 분할, 규칙 2 의 내 계좌 상대 레코드 생성)은 `flow_hint` 유무와 무관하게 항상 적용한다:
 
 1. `status == CANCELED` 인 CARD 거래 → 원 승인 `SPEND(−)` 와 같은 시각 `REFUND(+)` 두 건으로 기록(이력 보존, 순액 0).
 2. `exclude_tag == SELF_TRANSFER` 또는 `counterparty_account_id` 가 내 계좌 → `TRANSFER_INTERNAL` (봉투 없음).
-3. 고정비 매칭: `fixed_expenses` 의 (계좌 또는 카드, 금액 ±10%, payment_day ±3일) 에 맞으면 `FIXED`. 카드대금은 `merchant_name_raw` 에 "카드대금" 또는 `fixed_expenses.expense_type == CARD_BILL` 매칭 → `CARD_BILL`.
+3. 고정비 매칭: `fixed_expenses` 의 (계좌 또는 카드, 금액 ±10%, payment_day ±3일) 에 맞으면 `FIXED`. 카드대금은 `merchant_name_raw` 에 "카드대금" 또는 `fixed_expenses.expense_type == CARD_BILL` 매칭 → `CARD_BILL`. 단 `subcategory_id` 가 있는 거래는 소비로 보고 고정비 후보에서 제외한다(단, `fixed_expenses.name == merchant_name_raw` 면 예외로 매칭). 계좌 매칭은 `tx_type ∈ {WITHDRAW, TRANSFER}` 에만 적용하고, `tx_type == CARD` 는 `fixed_expenses.card_id` 와만 매칭한다.
 4. `tx_type == DEPOSIT` 이고 `is_income` 계좌 → `INCOME`. 그 외 DEPOSIT 은 `REFUND`(더치페이 입금 포함, `exclude_tag == DUTCH` 면 해당 봉투에 +).
 5. 나머지 CARD/WITHDRAW → `SPEND`. `subcategory_id` 로 봉투 결정. null 이면 `기타`, confidence 0.3.
 
@@ -256,6 +258,7 @@ Engine
 | 카드대금(미청구) | `cards.unbilled` | 다음 월요일 발행 후 첫 `withdrawal_weekday` | `unbilled` | 0.9 |
 | 카드대금(미결제) | `issued_unpaid` | 다음 `withdrawal_weekday`(as_of 포함) | 청구액 | 1.0 |
 | 원장 탐지 반복 고정비 | `FIXED` 거래를 (계좌/카드, 이름) 로 묶어 월 1회(간격 25~35일) 2회 이상 반복 | 마지막 발생 + 1개월 | 최근 3회 중앙값 | 0.9 |
+| 원장 탐지 반복 자기이체 | `TRANSFER_INTERNAL` 거래를 (출금 계좌, 상대 계좌, 금액 ±10%) 로 묶어 월 1회(간격 25~35일) 2회 이상 반복 | 마지막 발생 + 1개월 | 최근 3회 중앙값 | 0.9 |
 
 중복 제거: `fixed_expenses` 와 원장 탐지가 같은 이름이면 `fixed_expenses` 우선. 동일 (kind, name, due) 는 하나.
 
@@ -276,7 +279,8 @@ Engine
 | `amount_mu[e], amount_sigma[e]` | 로그정규 MLE | sigma [0.2, 1.5]. `n_e < 5` 면 전 봉투 통합, 통합도 5 미만이면 `mu=ln 10000, sigma=0.6` |
 | `card_share[e]` | 카드 건수 / 건수 | `n_e=0` 이면 전체 비율, 그것도 0이면 0.5 |
 | `payday_boost` | 수입 후 7일 일평균 / 그 외 일평균 | [0.7, 2.0]. 표본 14일 미만이면 1.0 |
-| `elasticity[e]` | 봉투 잔여율 < 0.2 인 날 일평균 / 그 외 | [0.5, 2.0]. 저잔여일 5일 미만이면 1.0 |
+| `pre_payday_damp` | 다음 수입 5일 전 일평균 / 그 외 일평균 | [0.5, 1.3]. 표본 10일 미만이면 1.0 |
+| `elasticity[e]` | 봉투 잔여율 < 0.2 인 날 일평균 / 그 외 | [0.5, 2.0]. 저잔여일 5일 미만이면 1.0. 유연 봉투(외식·쇼핑·취미·여가·기타) 는 대표값 부근, 필수 봉투(교통비·의료·건강·편의점·마트·잡화) 는 1.0 근처 |
 | `shock_daily_prob, shock_mu, shock_sigma` | `금액 ≥ max(50,000, 5·exp(mu_e))` 건 | 0건이면 `0.01, ln 100000, 0.6` |
 | 수입 일정 (§6.6) | INCOME 거래 일자 간격 cv ≤ 0.25 이고 day-of-month 최빈 비율 ≥ 0.6 → 규칙적. 그 외 불규칙 | 1건 이하면 `next=None, expected=0` |
 
@@ -302,9 +306,15 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
 ```
 1 수입      d == next_income → liquidity += expected × (1+income_growth)^(년). 불규칙이면 금액에 LogNormal(0, 0.4) 잡음, 다음일 = d + median_gap
 2 고정비    큐 due == d. 계좌형: cash ≥ amount 면 차감, 부족하면 당일 거절 → unpaid_obligation 누적(재시도 없음). 카드형: card.unbilled += amount
+            큐의 SELF_TRANSFER 는 PRIMARY 에서 차감하고 emergency_fund 에 가산한다. 부족하면 당일 건너뛴다(재시도 없음)
 3 청구 발행 d.weekday()==0 → 카드별 issued.append(unbilled); unbilled = 0
-4 카드 출금 d.weekday()==withdrawal_weekday 또는 미결제 청구서가 있는 날(매일 재시도) → 오래된 것부터, cash ≥ total 이면 차감·제거, 부족하면 card_shortfall[p]=True, 청구서 유지
-5 소비      봉투별 λ = daily_rate × weekday_mult[wd] × boost × elasticity_gate × 1(price_index 는 금액에)
+4 카드 출금 청구서별 예정 출금일 = billing_date 이후(당일 포함) 첫 d.weekday()==withdrawal_weekday 인 날. 예정 출금일 전에는 그 청구서를 시도하지 않는다.
+            예정 출금일 이후로는 결제될 때까지 매일 재시도한다. 오래된 것부터 시도해 cash ≥ total 이면 차감·제거하고,
+            부족하면 card_shortfall[p]=True 로 표시하고 청구서를 유지한 채 그 카드의 그날 남은 청구서는 시도하지 않는다(중단).
+            cards[] 의 카드는 kind(CREDIT|DEBIT) 와 무관하게 전부 이 주 단위 청구 주기를 따른다(금융망 카드 모델).
+            체크카드(kind=DEBIT) 의 즉시 출금 소비는 이 단계가 아니라 tx_type=WITHDRAW 계좌 거래로 표현한다. kind 는 표시용이며 처리 로직을 분기하지 않는다.
+5 소비      봉투별 λ = daily_rate × weekday_mult[wd] × boost(d) × elasticity_gate × 1(price_index 는 금액에)
+            boost(d) = payday_boost^[수입 후 7일] × pre_payday_damp^[다음 수입 5일 전]
             n ~ Poisson(λ); 금액 ~ LogNormal(mu, sigma) × price_index_mult, 100원 반올림
             card_share 만큼 unbilled 로, 나머지는 cash ≥ amount 일 때 즉시 차감, 부족하면 suppressed_demand 누적
             envelope_spend[p,e] += Σ. 달이 바뀌면 spent 리셋
@@ -315,6 +325,8 @@ simulate(state, behavior, externals, *, horizon_days=30, n_paths=1000, seed=42,
             liquidity < 0 → any_shortfall[p]; 처음이면 first_shortfall_idx[p]=k
             결제 이벤트가 있던 날은 event_log[k] 에 (kind, amount, 성공 경로 비율) 기록
 ```
+
+생성기 전용: 7단계(주입) 자리에 생성기 전용 단계(카드 취소, 더치페이 수령)를 둔다. 이 단계는 시뮬레이터에 없다.
 
 벡터화: 경로 축을 numpy 배열로 동시에 진행. 포아송은 `rng.poisson(λ, n_paths)`, 금액은 총 건수만큼 한 번에 뽑아 `np.add.reduceat`.
 
@@ -403,7 +415,7 @@ def payment_risks() -> list[PaymentRisk]  # 약정 이벤트별 (due, kind, name
 
 `params`:
 ```jsonc
-{ "goal_type": "BALANCE",                 // BALANCE(목표일 잔액 ≥ target) | SAVE(기간 누적 저축 ≥ target) | ENVELOPE_ADHERE(이번 달 전 봉투 예산 내)
+{ "goal_type": "BALANCE",                 // BALANCE(목표일 절대 잔액 ≥ target) | SAVE(기간 누적 증분 저축 ≥ target, PRIMARY 잔액 증가분 기준. M2 확정) | ENVELOPE_ADHERE(이번 달 전 봉투 예산 내)
   "target_amount": 2000000, "target_date": "2026-12-31",    // ENVELOPE_ADHERE 는 둘 다 생략
   "protect_essential": true }             // 필수 봉투({교통비, 의료·건강, 편의점·마트·잡화}) 하한 80% 보장
 ```
@@ -579,14 +591,14 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 
 프로필 YAML(A_steady, B_card_crunch, C_impulsive, D_goal_saver) + 시드 → `TwinInput` 과 `ground_truth.json`.
 
-| 프로필 | 특징 | 주로 검증하는 모드 |
-| --- | --- | --- |
-| A_steady | 고정 급여 25일 315만, 체크카드 위주, 탄력도 0.75, 월 30만 비상금 적립 | FORECAST 기준선, RISK 가 조용히 SAFE |
-| B_card_crunch | 급여 287만, 카드 2장(화·토 출금) 90%, 월세 70만·대출 1,200만 6.8% | RISK, WHATIF(카드 청구 큐 전이) |
-| C_impulsive | 프리랜서 불규칙 입금 월 2~4회, 주말 배수 2.4, 탄력도 1.4, 돌발 잦음 | FORECAST 밴드 폭, OPTIMIZE |
-| D_goal_saver | 급여 10일 260만, 구독 5개, 예산 확정 상태, 12월 200만 목표 | GOAL, OPTIMIZE(구독 해지 후보) |
+| 프로필 | 특징 | 목표 수치 | pending_ratio | 주로 검증하는 모드 |
+| --- | --- | --- | --- | --- |
+| A_steady | 고정 급여 25일 315만, 체크카드 위주, 탄력도 0.75, 월 30만 비상금 적립 | 지출/수입 75~85% | .05 | FORECAST 기준선, RISK 가 조용히 SAFE |
+| B_card_crunch | 급여 25일 287만, 카드 2장(화·토 출금) 90%, 월세 70만·대출 1,200만 6.8% | 지출/수입 88~96%, card_shortfalls 3~8건 | .10 | RISK, WHATIF(카드 청구 큐 전이) |
+| C_impulsive | 프리랜서 불규칙 입금 월 2~4회, 주말 배수 2.4, 탄력도 1.4, 돌발 잦음 | - | .18 | FORECAST 밴드 폭, OPTIMIZE |
+| D_goal_saver | 급여 10일 260만, 구독 5개, 예산 확정 상태, 12월 말까지 as_of 잔액 대비 200만원 추가 저축(goal_type SAVE) 이 현 소비 유지 시 아슬아슬하게 미달 | 월 잉여 40~48만, as_of 잔액 250~350만 | .08 | GOAL, OPTIMIZE(구독 해지 후보) |
 
-생성 규칙은 §7.2 하루 처리 순서와 **동일**해야 한다(생성기가 시뮬레이터의 정답 분포). 생성기가 엔진에 숨기는 변수: payday_boost, pre_payday_damp, elasticity, 돌발 분포, 취소 확률, 더치페이, 잔액 부족 시 체크 거절(원장 미기록). `ground_truth.json`: `daily_balance`, `card_shortfalls[]`, `declined_debits[]`, `shocks[]`, `envelope_true_spend`, `income_events[]`, `hidden_params`. **엔진 코드는 ground_truth 를 읽지 않는다.**
+생성 규칙은 §7.2 하루 처리 순서와 **동일**해야 한다(생성기가 시뮬레이터의 정답 분포). 생성기가 엔진에 숨기는 변수: payday_boost, elasticity, 돌발 분포, 취소 확률, 더치페이, 잔액 부족 시 체크 거절(원장 미기록). 생성기는 `confirm_status` 의 `PENDING` 을 소비(SPEND) 거래에만 부여한다. 수입·고정비·카드대금·자기이체는 `CONFIRMED` 다. `ground_truth.json`: `daily_balance`, `card_shortfalls[]`, `declined_debits[]`(원소에 `kind`: FIXED | LOAN | SPEND 포함), `shocks[]`, `envelope_true_spend`, `income_events[]`, `hidden_params`, `unpaid_obligation`(일별 누적), `suppressed_demand`(일별 누적). **엔진 코드는 ground_truth 를 읽지 않는다.**
 
 시드 교란: `fdt gen --profile B --seed 1..20` 으로 캘리브레이션 표본 확보.
 
@@ -636,6 +648,7 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | R5 | 불규칙 수입 예측 오차 | 기준 완화(C). v0.2 에 수입 간격 분포 샘플링 |
 | R6 | `is_variable` 고정비 금액 추정 실패 | 원장 중앙값 없으면 0 + 경고. facts 에 `unknown_variable_fixed` 노출 |
 | R7 | facts 와 viz 라벨 불일치 | `fdt validate` 가 annotations·caption 의 숫자를 facts 집합과 대조 |
+| R8 | 생성기·시뮬레이터 규칙 발산 | §7.2 를 정본으로 삼는다. 두 코드가 공유 상수 모듈을 쓰게 하고, §15.A 표를 두 코드 공통 테스트로 고정한다 |
 | M1 | 확률 표기를 % 정수로 할지 소수로 할지 | 모드 내 통일만 강제. 에이전트 팀과 합의 후 고정 |
 | M2 | GOAL `SAVE` 타입의 "저축" 정의(비상금 이체 포함 여부) | v0.1: PRIMARY 잔액 증가분으로 정의 |
 
@@ -702,3 +715,20 @@ fdt schema  --out schemas/                                  # TwinInput/State/Be
 | 추가1 | §8.2 `min_point`/`end_point`, §8.5 `expected_shortfall`/`payment_risks[].median_balance_before`, §8.3 base/branch 요약의 최저·말일 잔액을 정수 원(반올림)으로 명시. `trajectory` 배열만 float 유지 |
 | 추가2 | §4.2 에 "엔진 코어(`fdt/engine/**`)는 파일·콘솔 I/O 를 하지 않는다. 도구는 `fdt/tools/`" 항목 추가 |
 | 추가3 | §5.1 `AccountState.role` 에 `OTHER`(비관리 계좌) 허용을 명시 |
+
+`docs/reviews/20260907_W1_W2.md` W1·W2 리뷰의 "SPEC 수정 제안" 반영 내역 (v0.2 → v0.3).
+
+| # | 요약 |
+| --- | --- |
+| S16 | §7.2 4단계 카드 출금 규칙을 §15.A 를 정본으로 정밀화. 예정 출금일 = billing_date 이후(당일 포함) 첫 withdrawal_weekday, 그 전엔 시도 안 함, 이후 매일 재시도, 부족 시 그 카드의 그날 남은 청구서는 시도하지 않는다(중단) |
+| S17 | §5.2 규칙 3 에 판별자 추가. `subcategory_id` 가 있으면 소비로 보아 고정비 후보에서 제외(단 `fixed_expenses.name == merchant_name_raw` 면 예외), 계좌 매칭은 `tx_type ∈ {WITHDRAW, TRANSFER}` 에만, `tx_type == CARD` 는 `fixed_expenses.card_id` 와만 매칭 |
+| S18 | §7.2 표 아래에 "생성기는 7단계(주입) 자리에 생성기 전용 단계(카드 취소, 더치페이 수령)를 둔다. 이 단계는 시뮬레이터에 없다" 한 줄 추가 |
+| S19 | §5.2 흐름 판정 서문을 "`flow_hint` 는 흐름 라벨만 덮어쓰고, 구조 변환(취소 분할·내 계좌 상대 레코드 생성)은 `flow_hint` 유무와 무관하게 항상 적용한다" 로 정밀화 |
+| S20 | §11 에 "생성기는 `confirm_status` 의 `PENDING` 을 소비(SPEND) 거래에만 부여한다. 수입·고정비·카드대금·자기이체는 `CONFIRMED` 다" 추가, 프로필 표에 `pending_ratio` 열 추가(A .05, B .10, C .18, D .08) |
+| S21 | §11 D 프로필 행의 목표를 "12월 말까지 as_of 잔액 대비 200만원 추가 저축(goal_type SAVE) 이 현 소비 유지 시 아슬아슬하게 미달" 로 확정. §8.4 `goal_type` 정의에 `BALANCE`=절대 잔액, `SAVE`=증분 저축(PRIMARY 잔액 증가분 기준, M2 확정) 명시 |
+| S22 | §5.4 약정 큐에 "원장 탐지 반복 자기이체" 행 추가, §5.1 `committed.kind` 허용 집합에 `SELF_TRANSFER` 추가, §7.2 2단계에 "큐의 `SELF_TRANSFER` 는 PRIMARY 차감 + `emergency_fund` 가산, 부족하면 당일 건너뜀" 추가. §5.2 `LedgerTx` 정의에 `counterparty_account_id` 필드 명시 |
+| S23 | §7.2 5단계 `boost` 를 `boost(d) = payday_boost^[수입 후 7일] × pre_payday_damp^[다음 수입 5일 전]` 복합 계수로 정의. §6 표에 `pre_payday_damp` 행(다음 수입 5일 전 일평균 / 그 외, 클립 [0.5, 1.3], 표본 10일 미만 1.0) 추가, §11 숨김 변수 목록에서 `pre_payday_damp` 제거 |
+| S24 | §6 `elasticity[e]` 행에 "탄력도는 유연 봉투 대표값이고 필수 봉투는 1.0 근처" 명시 |
+| S25 | §5.2 `LedgerTx` 정의에 "`tx_type == CARD` 인 거래의 `account_id` 는 `None`" 명시. §3.2 `cards` 주석과 §7.2 4단계에 "`cards[]` 의 카드는 `kind` 와 무관하게 전부 주 단위 청구 주기를 따른다(금융망 카드 모델). 체크카드 즉시 출금 소비는 `tx_type=WITHDRAW` 계좌 거래로 표현한다. `kind` 는 표시용" 명시 |
+| S26 | §11 `ground_truth.json` 필드 목록에 `declined_debits[].kind`, `unpaid_obligation`, `suppressed_demand` 추가 |
+| S27 | §11 프로필 표 B 행에 "급여 25일 287만" 명시 |

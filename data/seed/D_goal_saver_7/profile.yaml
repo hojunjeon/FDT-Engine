@@ -1,10 +1,10 @@
 name: D_goal_saver
 description: 급여 10일, 구독 5개, 예산 CONFIRMED. 저축 목표를 아슬아슬하게 못 채우는 소비 흐름.
 accounts:
-- {id: 10, alias: 급여통장, is_income: true, opening_balance: 900000, managed: true}
+- {id: 10, alias: 급여통장, is_income: true, opening_balance: 600000, managed: true}
 cards:
-- {id: 20, alias: 국민 체크카드, kind: DEBIT, withdrawal_weekday: 2, withdrawal_account_id: 10}
-income: {type: SALARY, day_of_month: 10, amount: 2600000, jitter_sigma: 0.0, median_gap_days: null}
+- {id: 20, alias: 국민 체크카드, kind: CREDIT, withdrawal_weekday: 2, withdrawal_account_id: 10}
+income: {type: SALARY, amount: 2600000, day_of_month: 10, jitter_sigma: 0.0, median_gap_days: null}
 fixed_expenses:
 - {id: 40, name: 넷플릭스, expense_type: SUBSCRIPTION, amount: 17000, is_variable: false,
   payment_day: 1, withdrawal_account_id: null, card_id: 20}
@@ -16,6 +16,8 @@ fixed_expenses:
   payment_day: 5, withdrawal_account_id: 10, card_id: null}
 - {id: 44, name: 정수기 렌탈, expense_type: SUBSCRIPTION, amount: 25000, is_variable: false,
   payment_day: 15, withdrawal_account_id: 10, card_id: null}
+- {id: 45, name: 월세, expense_type: RENT, amount: 750000, is_variable: false, payment_day: 25,
+  withdrawal_account_id: 10, card_id: null}
 loans: []
 budgets:
   confirmed: true
@@ -23,52 +25,54 @@ budgets:
     기타: 50000}
 spending:
   외식:
-    daily_rate: 0.55
+    daily_rate: 1.3
     amount_mu: 9.1
     amount_sigma: 0.5
     card_share: 0.6
     weekday_mult: [0.9, 0.9, 1.0, 1.0, 1.1, 1.3, 1.1]
   교통비:
-    daily_rate: 0.85
+    daily_rate: 1.3
     amount_mu: 7.6
     amount_sigma: 0.4
     card_share: 0.6
     weekday_mult: [1.2, 1.2, 1.2, 1.2, 1.2, 0.5, 0.4]
   의료·건강:
-    daily_rate: 0.08
+    daily_rate: 0.14
     amount_mu: 9.4
     amount_sigma: 0.6
     card_share: 0.6
     weekday_mult: [1.1, 1.1, 1.1, 1.1, 1.0, 0.6, 0.5]
   취미·여가:
-    daily_rate: 0.18
+    daily_rate: 0.43
     amount_mu: 9.6
     amount_sigma: 0.7
     card_share: 0.6
     weekday_mult: [0.6, 0.6, 0.7, 0.8, 1.3, 1.6, 1.3]
   쇼핑:
-    daily_rate: 0.15
+    daily_rate: 0.36
     amount_mu: 9.8
     amount_sigma: 0.7
     card_share: 0.6
     weekday_mult: [0.9, 0.9, 0.9, 1.0, 1.1, 1.2, 1.1]
   편의점·마트·잡화:
-    daily_rate: 0.65
+    daily_rate: 1.2
     amount_mu: 8.4
     amount_sigma: 0.5
     card_share: 0.6
     weekday_mult: [1.0, 1.0, 1.0, 1.0, 1.0, 1.1, 1.0]
   기타:
-    daily_rate: 0.05
+    daily_rate: 0.12
     amount_mu: 9.7
     amount_sigma: 0.7
     card_share: 0.6
-    weekday_mult: [1, 1, 1, 1, 1, 1, 1]
+    weekday_mult: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 hidden:
   payday_boost: 1.1
   pre_payday_damp: 0.9
-  elasticity: 0.85
+  elasticity: {외식: 0.85, 교통비: 1.0, 의료·건강: 1.0, 취미·여가: 0.85, 쇼핑: 0.85, 편의점·마트·잡화: 1.0,
+    기타: 0.85}
   shock: {daily_prob: 0.01, mu: 11.3, sigma: 0.5}
   cancel_prob: 0.02
   dutch_pay_prob: 0.05
   emergency_transfer_monthly: 0
+  pending_ratio: 0.08

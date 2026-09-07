@@ -64,10 +64,17 @@ class LedgerTx:
     `id` 는 대부분 원본 `transactions[].id` 와 같다. 예외 둘:
     (1) 취소(CANCELED) CARD 거래는 SPEND(-)/REFUND(+) 두 건으로 나뉘고, SPEND
         건은 원본 id 를, REFUND 건은 `-원본id` 를 쓴다(이력 보존, 순액 0).
-    (2) TRANSFER_INTERNAL 로 판정되고 상대 계좌가 내 계좌면, 그 계좌에 +
-        레코드를 하나 더 만든다. 이 레코드의 id 는 `원본id * 10 + 1` 이다
-        (결정론적 규칙, 원본 id 와 절대 겹치지 않도록 자릿수를 늘린다).
+    (2) 내 계좌가 상대편인 거래(구조 변환, N7)는 그 계좌에 + 레코드를 하나
+        더 만든다. 이 레코드의 id 는 `원본id * 10 + 1` 이다(결정론적 규칙,
+        원본 id 와 절대 겹치지 않도록 자릿수를 늘린다).
     두 경우 모두 `origin_tx_id` 는 항상 원본 `transactions[].id` 를 가리킨다.
+
+    `counterparty_account_id` (S22 준비, W3 State 의 반복 자기이체 탐지가
+    사용할 필드): 원 레코드에서는 거래 상대 계좌(`transactions[].
+    counterparty_account_id` 를 그대로 물려받음), 구조 변환으로 생긴 상대
+    레코드에서는 원 레코드의 계좌(`transactions[].account_id`)를 가리킨다.
+    상대 계좌가 없거나(일반 SPEND 등) 카드 거래라 `account_id` 가 `None` 인
+    경우는 `None` 이다.
     """
 
     id: int
@@ -85,6 +92,7 @@ class LedgerTx:
     exclude_tag: ExcludeTag
     confirm_status: ConfirmStatus
     origin_tx_id: int
+    counterparty_account_id: int | None
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +113,8 @@ def normalize(twin: TwinInput, as_of: date | None = None) -> tuple[LedgerTx, ...
     1. `status == CANCELED` 인 CARD 거래 -> SPEND(-)/REFUND(+) 두 건.
     2. `exclude_tag == SELF_TRANSFER` 또는 상대 계좌가 내 계좌 -> TRANSFER_INTERNAL.
     3. 고정비/카드대금 매칭 -> FIXED / CARD_BILL.
-    4. `tx_type == DEPOSIT` -> `is_income` 계좌면 INCOME, 아니면 REFUND.
+    4. `tx_type == DEPOSIT` -> `exclude_tag == DUTCH` 면 계좌와 무관하게
+       REFUND(봉투 +). 아니면 `is_income` 계좌면 INCOME, 아니면 REFUND.
     5. 나머지 CARD/WITHDRAW -> SPEND.
     """
 
@@ -128,33 +137,61 @@ def normalize(twin: TwinInput, as_of: date | None = None) -> tuple[LedgerTx, ...
 def _normalize_one(
     tx: TransactionIn, twin: TwinInput, account_ids: set[int]
 ) -> list[LedgerTx]:
-    if tx.flow_hint is not None:
-        return _build_records_for_flow(tx, tx.flow_hint, account_ids)
+    """거래 한 건 -> 레코드 목록 (SPEC 5.2, N7 반영: 구조 변환과 흐름 라벨 분리).
+
+    두 단계로 나눈다.
+
+    1. 흐름 라벨(`flow`) 결정: `flow_hint` 가 있으면 그것을 그대로 쓰고,
+       없으면 `_classify_flow` 의 판정 순서 2~5 를 따른다(규칙 1의 취소
+       판정은 라벨이 아니라 구조 변환이라 여기 포함하지 않는다).
+    2. 구조 변환: `status == CANCELED and tx_type == CARD` 인 거래는
+       `flow_hint` 유무와 무관하게 항상 SPEND(-)/REFUND(+) 두 건으로
+       나뉜다(1 단계에서 정한 라벨은 그 두 건에 그대로 적용된다 - 기본값은
+       SPEND/REFUND). 그 외 거래는 `_build_records_for_flow` 가 만들며,
+       `counterparty_account_id` 가 내 계좌면(구조 조건) `flow_hint` 유무와
+       무관하게 상대 계좌 레코드가 항상 추가된다.
+    """
 
     if tx.status == TxStatus.CANCELED and tx.tx_type == TxType.CARD:
-        return _build_cancel_pair(tx)
+        return _build_cancel_pair(tx, tx.flow_hint)
+
+    flow = tx.flow_hint if tx.flow_hint is not None else _classify_flow(tx, twin, account_ids)
+    return _build_records_for_flow(tx, flow, account_ids)
+
+
+def _classify_flow(tx: TransactionIn, twin: TwinInput, account_ids: set[int]) -> Flow:
+    """`flow_hint` 가 없을 때의 흐름 판정 순서 2~5 (SPEC 5.2).
+
+    규칙 1(취소 CARD 거래 분할)은 구조 변환이라 `_normalize_one` 에서 별도로
+    처리하고 여기서는 다루지 않는다.
+    """
 
     if tx.exclude_tag == ExcludeTag.SELF_TRANSFER or (
         tx.counterparty_account_id is not None and tx.counterparty_account_id in account_ids
     ):
-        return _build_records_for_flow(tx, Flow.TRANSFER_INTERNAL, account_ids)
+        return Flow.TRANSFER_INTERNAL
 
     matched_fixed = _match_fixed_expense(tx, twin)
     if matched_fixed is not None:
         if matched_fixed.expense_type == FixedExpenseType.CARD_BILL:
-            return _build_records_for_flow(tx, Flow.CARD_BILL, account_ids)
-        return _build_records_for_flow(tx, Flow.FIXED, account_ids)
+            return Flow.CARD_BILL
+        return Flow.FIXED
 
     if tx.merchant_name_raw is not None and CARD_BILL_MERCHANT_KEYWORD in tx.merchant_name_raw:
-        return _build_records_for_flow(tx, Flow.CARD_BILL, account_ids)
+        return Flow.CARD_BILL
 
     if tx.tx_type == TxType.DEPOSIT:
+        if tx.exclude_tag == ExcludeTag.DUTCH:
+            # SPEC 5.2 규칙 4: "그 외 DEPOSIT 은 REFUND(더치페이 입금 포함,
+            # exclude_tag == DUTCH 면 해당 봉투에 +)". DUTCH 는 입금 계좌의
+            # is_income 과 무관하게 항상 REFUND(봉투 +) 다(B2).
+            return Flow.REFUND
         account = _account_by_id(twin, tx.account_id)
         if account is not None and account.is_income:
-            return _build_records_for_flow(tx, Flow.INCOME, account_ids)
-        return _build_records_for_flow(tx, Flow.REFUND, account_ids)
+            return Flow.INCOME
+        return Flow.REFUND
 
-    return _build_records_for_flow(tx, Flow.SPEND, account_ids)
+    return Flow.SPEND
 
 
 def _account_by_id(twin: TwinInput, account_id: int | None):
@@ -186,9 +223,11 @@ def _envelope_and_confidence(
 
 
 def _card_tx_account_id(tx: TransactionIn) -> int | None:
-    # SPEC 5.2 신규 규칙: "카드(CARD) 거래는 account_id=None(계좌 잔액에
-    # 영향 없음, 카드대금 출금 시 반영)". CARD 승인은 unbilled 만 올리고
-    # 계좌 잔액은 나중 CARD_BILL(WITHDRAW) 이 깎을 때만 바뀐다.
+    # SPEC 5.2 `LedgerTx` 정의 (S25 제안 반영 예정): "tx_type == CARD 인
+    # 거래의 LedgerTx.account_id 는 None 이다. 카드 승인은 계좌 잔액에 영향이
+    # 없고 CARD_BILL 출금에서만 반영된다(§3.3 계좌 대사의 전제)". CARD 승인은
+    # unbilled 만 올리고 계좌 잔액은 나중 CARD_BILL(WITHDRAW) 이 깎을 때만
+    # 바뀐다.
     if tx.tx_type == TxType.CARD:
         return None
     return tx.account_id
@@ -216,16 +255,17 @@ def _build_records_for_flow(
         exclude_tag=tx.exclude_tag,
         confirm_status=tx.confirm_status,
         origin_tx_id=tx.id,
+        counterparty_account_id=tx.counterparty_account_id,
     )
     records = [main]
 
-    if (
-        flow == Flow.TRANSFER_INTERNAL
-        and tx.counterparty_account_id is not None
-        and tx.counterparty_account_id in account_ids
-    ):
-        # 결정론적 상대 계좌 레코드 id 규칙: origin_tx_id * 10 + 1. 원본
-        # transactions[].id 가 int 인 한 절대 원본 id 와 겹치지 않는다.
+    if tx.counterparty_account_id is not None and tx.counterparty_account_id in account_ids:
+        # 구조 변환(N7): 내 계좌가 상대편인 거래는 상대 계좌 레코드가 항상
+        # 추가된다 - `flow_hint` 유무·값과 무관하다. `flow` 라벨은 그대로
+        # 물려받되(라벨만 덮어쓰는 규칙), signed_amount 는 이중 기록을 위해
+        # 항상 main 의 반대 부호(+tx.amount)로 고정한다. 결정론적 상대 계좌
+        # 레코드 id 규칙: origin_tx_id * 10 + 1. 원본 transactions[].id 가
+        # int 인 한 절대 원본 id 와 겹치지 않는다.
         counterparty = LedgerTx(
             id=tx.id * 10 + 1,
             date=tx.tx_date,
@@ -233,7 +273,7 @@ def _build_records_for_flow(
             account_id=tx.counterparty_account_id,
             card_id=None,
             signed_amount=tx.amount,
-            flow=Flow.TRANSFER_INTERNAL,
+            flow=flow,
             envelope_id=None,
             subcategory_id=None,
             confidence=1.0,
@@ -242,20 +282,30 @@ def _build_records_for_flow(
             exclude_tag=tx.exclude_tag,
             confirm_status=tx.confirm_status,
             origin_tx_id=tx.id,
+            # 상대 레코드에서는 "상대"가 원 레코드의 계좌다.
+            counterparty_account_id=tx.account_id,
         )
         records.append(counterparty)
 
     return records
 
 
-def _build_cancel_pair(tx: TransactionIn) -> list[LedgerTx]:
+def _build_cancel_pair(tx: TransactionIn, flow_hint: Flow | None) -> list[LedgerTx]:
     # SPEC 5.2 규칙 1: 원 승인 SPEND(-) 와 같은 시각 REFUND(+) 두 건, 이력
-    # 보존·순액 0. 둘 다 같은 봉투/confidence 를 써야 envelope_net_spend 가
-    # 정확히 상쇄된다.
-    envelope_id, confidence = _envelope_and_confidence(
-        Flow.SPEND, tx.subcategory_id, tx.confirm_status
-    )
+    # 보존·순액 0. 이 구조 변환은 `flow_hint` 유무와 무관하게 항상 실행된다
+    # (N7). `flow_hint` 가 없으면 기본 라벨 SPEND/REFUND 를 쓰고, 있으면 두
+    # 레코드의 라벨을 그 값으로 덮어쓴다(구조 - 부호 -tx.amount/+tx.amount -
+    # 는 라벨과 무관하게 고정).
+    spend_flow = flow_hint if flow_hint is not None else Flow.SPEND
+    refund_flow = flow_hint if flow_hint is not None else Flow.REFUND
     account_id = _card_tx_account_id(tx)
+
+    spend_envelope_id, spend_confidence = _envelope_and_confidence(
+        spend_flow, tx.subcategory_id, tx.confirm_status
+    )
+    refund_envelope_id, refund_confidence = _envelope_and_confidence(
+        refund_flow, tx.subcategory_id, tx.confirm_status
+    )
 
     spend = LedgerTx(
         id=tx.id,
@@ -264,15 +314,16 @@ def _build_cancel_pair(tx: TransactionIn) -> list[LedgerTx]:
         account_id=account_id,
         card_id=tx.card_id,
         signed_amount=-tx.amount,
-        flow=Flow.SPEND,
-        envelope_id=envelope_id,
+        flow=spend_flow,
+        envelope_id=spend_envelope_id,
         subcategory_id=tx.subcategory_id,
-        confidence=confidence,
+        confidence=spend_confidence,
         source=tx.source,
         merchant_name_raw=tx.merchant_name_raw,
         exclude_tag=tx.exclude_tag,
         confirm_status=tx.confirm_status,
         origin_tx_id=tx.id,
+        counterparty_account_id=tx.counterparty_account_id,
     )
     refund = LedgerTx(
         id=-tx.id,
@@ -281,15 +332,16 @@ def _build_cancel_pair(tx: TransactionIn) -> list[LedgerTx]:
         account_id=account_id,
         card_id=tx.card_id,
         signed_amount=tx.amount,
-        flow=Flow.REFUND,
-        envelope_id=envelope_id,
+        flow=refund_flow,
+        envelope_id=refund_envelope_id,
         subcategory_id=tx.subcategory_id,
-        confidence=confidence,
+        confidence=refund_confidence,
         source=tx.source,
         merchant_name_raw=tx.merchant_name_raw,
         exclude_tag=tx.exclude_tag,
         confirm_status=tx.confirm_status,
         origin_tx_id=tx.id,
+        counterparty_account_id=tx.counterparty_account_id,
     )
     return [spend, refund]
 
@@ -300,14 +352,36 @@ def _build_cancel_pair(tx: TransactionIn) -> list[LedgerTx]:
 
 
 def _match_fixed_expense(tx: TransactionIn, twin: TwinInput) -> FixedExpenseIn | None:
+    """고정비 후보 매칭 (SPEC 5.2 규칙 3, S17 반영).
+
+    `subcategory_id` 가 있는 거래는 소비로 보고 고정비 후보에서 제외한다
+    (세분류가 붙었다는 것은 사람이 분류한 소비라는 뜻). 단
+    `fixed_expenses.name == merchant_name_raw` 로 정확히 같으면 이 가드를
+    우회해 예외적으로 매칭한다(LIVE 데이터에서 세분류가 붙은 고정비가 들어올
+    수 있다). 계좌 매칭(`withdrawal_account_id`)은 `tx_type ∈ {WITHDRAW,
+    TRANSFER}` 에만 적용한다 - CARD 거래는 카드 승인이라 계좌형 고정비와
+    같은 계좌를 공유할 뿐 별개의 소비이기 쉽다. `tx_type == CARD` 는
+    `fixed_expenses.card_id` 와만 매칭한다(B3).
+    """
+
     for fx in twin.fixed_expenses:
         if not fx.active:
             continue
+
+        name_matches = tx.merchant_name_raw is not None and tx.merchant_name_raw == fx.name
+        if tx.subcategory_id is not None and not name_matches:
+            continue
+
         account_matches = (
             fx.withdrawal_account_id is not None
+            and tx.tx_type in (TxType.WITHDRAW, TxType.TRANSFER)
             and tx.account_id == fx.withdrawal_account_id
         )
-        card_matches = fx.card_id is not None and tx.card_id == fx.card_id
+        card_matches = (
+            fx.card_id is not None
+            and tx.tx_type == TxType.CARD
+            and tx.card_id == fx.card_id
+        )
         if not (account_matches or card_matches):
             continue
         if not _amount_within_tolerance(tx.amount, fx.amount):
@@ -351,11 +425,18 @@ def _payment_day_within_tolerance(tx_date: date, payment_day: int) -> bool:
 def envelope_net_spend(
     ledger: tuple[LedgerTx, ...], start: date, end: date
 ) -> dict[int, int]:
-    """봉투별 순지출 = |Σ(SPEND + REFUND(봉투 있는 것))|, [start, end] 양끝 포함.
+    """봉투별 순지출 = -(Σ(SPEND + REFUND(봉투 있는 것))), [start, end] 양끝 포함.
 
-    `exclude_tag ∈ {EMERGENCY, CARRYOVER}` 는 제외한다. DUTCH 입금(REFUND)은
-    제외 대상이 아니므로 그대로 합산돼 순지출을 줄인다(SPEC 5.2). 취소 거래는
-    SPEND(-amount)+REFUND(+amount) 가 같은 봉투로 상쇄돼 0이 된다.
+    SPEND 는 `signed_amount` 가 음수이므로 부호를 반전해 "지출은 양수" 로
+    맞춘다. `exclude_tag ∈ {EMERGENCY, CARRYOVER}` 는 제외한다. DUTCH
+    입금(REFUND)은 제외 대상이 아니므로 그대로 합산돼 순지출을 줄인다(SPEC
+    5.2). 취소 거래는 SPEND(-amount)+REFUND(+amount) 가 같은 봉투로 상쇄돼
+    0이 된다.
+
+    한 달의 DUTCH REFUND 합이 SPEND 합을 넘으면(더치 정산 수령이 실제 지출을
+    초과) 결과는 **음수**일 수 있다(N9). `abs()` 로 부호를 삼키면 안 된다 -
+    State 의 `remaining = budget - spent` 는 `spent` 가 음수여도 그대로
+    성립한다(남은 예산이 더 커진다).
     """
 
     totals: dict[int, int] = {}
@@ -370,7 +451,7 @@ def envelope_net_spend(
             continue
         totals[record.envelope_id] = totals.get(record.envelope_id, 0) + record.signed_amount
 
-    return {envelope_id: abs(total) for envelope_id, total in totals.items()}
+    return {envelope_id: -total for envelope_id, total in totals.items()}
 
 
 # ---------------------------------------------------------------------------

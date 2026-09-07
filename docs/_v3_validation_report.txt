@@ -3,18 +3,18 @@
    2026-07  income=  3252000  expense=  2162000  transfer=  500000
    2026-08  income=  3219000  expense=  2237200  transfer=  500000
    2026-09  income=        0  expense=    66600  transfer=       0
-== P003  rows=197  issues=0
-   2026-06  income=  1036600  expense=  1070990  transfer=  100000
-   2026-07  income=  1812300  expense=  1339790  transfer=  100000
-   2026-08  income=  4182000  expense=  3318990  transfer=  100000
-   2026-09  income=   500000  expense=    56300  transfer=       0
+== P003  rows=193  issues=0
+   2026-06  income=  1036600  expense=  1071290  transfer=  100000
+   2026-07  income=  1812300  expense=  1326090  transfer=  100000
+   2026-08  income=  4182000  expense=  3310590  transfer=  100000
+   2026-09  income=   500000  expense=    61000  transfer=       0
 == P004  rows=262  issues=0
-   2026-06  income=  9284350  expense=  4341210  transfer=  300000
-   2026-07  income=  2031850  expense=  5679270  transfer=  300000
-   2026-08  income=  5899850  expense=  5741630  transfer= 1800000
-   2026-09  income=        0  expense=   365200  transfer=       0
-== P005  rows=189  issues=0
-   2026-06  income=  2680000  expense=  1731000  transfer=  300000
+   2026-06  income=  9284350  expense=  4340810  transfer=  300000
+   2026-07  income=  2031850  expense=  5686570  transfer=  300000
+   2026-08  income=  5899850  expense=  5732330  transfer= 1800000
+   2026-09  income=        0  expense=   360700  transfer=       0
+== P005  rows=188  issues=0
+   2026-06  income=  2680000  expense=  1711000  transfer=  300000
    2026-07  income=  2880000  expense=  1940350  transfer=  300000
    2026-08  income=  2880000  expense=  2600900  transfer=  300000
    2026-09  income=   200000  expense=    52000  transfer=       0

@@ -123,6 +123,10 @@ class Builder:
                     src, st = "RULE", "AUTO"
                 else:
                     src, st = "MODEL", "CONFIRMED"
+                    if recurring:  # 첫 거래에서는 반복성을 알 수 없음 → 두 번째부터 recurring
+                        recurring, fixed = False, False
+                        pattern = "PLANNED" if pattern == "FIXED" else pattern
+                        memo = memo + " (첫 결제, 사용자 확정)"
         else:
             st = status or "AUTO"
         if status:
@@ -374,7 +378,7 @@ def gen_p003():
                 if R.random() < 0.4:
                     b.add(date, b.t(20, 10, 40), "GS25 신수점", b.amt(5000, 0.3), "저녁 간식")
             elif wd in (5, 6):
-                if R.random() < 0.35:
+                if date != d(7, 26) and R.random() < 0.35:                 # 7/26 은 토익 시험
                     b.add(date, b.t(13, 20, 40), "요기요", b.amt(15500, 0.15), "주말 배달 점심")
                 if date != d(7, 4) and R.random() < 0.3:                   # 7/4 는 홍대 술자리
                     b.add(date, b.t(21, 30, 30), "GS25 신수점", b.amt(4300, 0.3), "주말 야식")
@@ -458,7 +462,8 @@ def gen_p003():
     b.add(d(7, 18), "16:00", "다이소 신촌점", 8000, "생활용품", pattern="PLANNED")
     for mo, day_ in ((6, 16), (7, 14), (8, 12)):
         b.add(d(mo, day_), "21:20", "쿠팡", b.amt(24000, 0.15), "생필품 온라인", pattern="PLANNED")
-    b.add(d(9, 2), "19:30", "신수동 마라탕", 12500, "저녁 (신규 가맹점)", src="MODEL", status="PENDING")
+    b.add(d(9, 2), "12:40", "신수동 마라탕", 12500, "수요일 점심 (신규 가맹점)", src="MODEL", status="PENDING",
+          sub="점심")
 
     return b.finish(os.path.join(HERE, "persona_consumption_90d_v3_P003.csv"))
 
@@ -552,8 +557,8 @@ def gen_p004():
         if date in trip:
             return
         if is_workday(date) and wd <= 3:                                # 코워킹 출근 (자가용, 결제 없음)
-            if date in (d(6, 24), d(7, 22), d(8, 19)):
-                return                                                   # 고객 미팅 날 별도 처리
+            if date in (d(6, 24), d(7, 22), d(8, 19), d(9, 1)):
+                return                                                   # 고객 미팅 / 신규 가맹점 날 별도 처리
             name, price = R.choice(lunches)
             b.add(date, b.t(12, 20, 20), name, price, "판교 점심")
             if R.random() < 0.7:
@@ -678,6 +683,7 @@ def gen_p004():
     b.add(d(8, 2), "13:30", "SK에너지 강릉IC셀프", 45000, "귀가 주유")
 
     b.add(d(9, 1), "12:15", "판교 라멘집", 11000, "판교 점심 (신규 가맹점)", src="MODEL", status="PENDING")
+    b.add(d(9, 1), "13:12", "폴바셋 판교점", 5300, "식후 커피")
     return b.finish(os.path.join(HERE, "persona_consumption_90d_v3_P004.csv"))
 
 
@@ -785,8 +791,8 @@ def gen_p005():
         b.income(prevbiz(d(mo, 25)), "09:00", "공무원연금공단", 2680000, "공무원연금 (매월 25일, 휴일이면 전 영업일)",
                  bizday=False)
         b.save(d(mo, 26), "08:00", "대구은행 정기적금", 300000, "정기적금 자동이체 → ACC-DEMO-005-S")
-        b.send(biz(d(mo, 3)), "10:00", "팔공산 산악회 총무 이OO", 20000, "산악회 월 회비", pattern="FIXED")
     for mo in (7, 8):
+        b.send(biz(d(mo, 3)), "10:00", "팔공산 산악회 총무 이OO", 20000, "산악회 월 회비", pattern="FIXED")
         b.bill(d(mo, 5), "09:30", "현대해상 실손보험", 87300, "실손보험료 자동이체")
     for mo in (7, 8, 9):
         b.recv(d(mo, 1), "20:15", "딸 김수진 (용돈)", 200000, "딸 용돈 (매월 1일)")
@@ -855,6 +861,8 @@ def validate(path):
     assert len(set(r["transaction_id"] for r in rows)) == len(rows), "duplicate id"
     for r in rows:
         date = dt.date.fromisoformat(r["transaction_date"])
+        if not (D0 <= date <= D1):
+            issues.append("기간 밖 %s %s" % (r["transaction_id"], date))
         if W[date.weekday()] != r["day_of_week"]:
             issues.append("요일 불일치 %s" % r["transaction_id"])
         if not re.fullmatch(r"\d{2}:\d{2}", r["transaction_time"]):
@@ -884,6 +892,15 @@ def validate(path):
     for r in rows:
         if r["classify_source"] == "MODEL" and first[r["merchant"]] is not r and r["confirm_status"] != "PENDING":
             issues.append("MODEL 재등장 %s" % r["transaction_id"])
+    # 같은 날 식사(점심/저녁/배달) 2건이 90분 이내 → 중복 식사
+    meal_subs = {"점심", "저녁/외식", "배달"}
+    for date, rs in group_by_day(rows).items():
+        meals = [r for r in rs if r["direction"] == "EXPENSE" and r["subcategory"] in meal_subs]
+        for a, c in zip(meals, meals[1:]):
+            ta = int(a["transaction_time"][:2]) * 60 + int(a["transaction_time"][3:])
+            tc = int(c["transaction_time"][:2]) * 60 + int(c["transaction_time"][3:])
+            if tc - ta < 90:
+                issues.append("중복 식사 %s %s (%s / %s)" % (date, c["transaction_id"], a["merchant"], c["merchant"]))
     # 이동 체인: (A→B) 메모의 출발지가 직전 이동의 도착지와 맞는지 (같은 날)
     for date, rs in group_by_day(rows).items():
         loc = None
